@@ -45,6 +45,7 @@ const ThreadContext = struct {
     label: []const u8,
     origin_channel: []const u8,
     origin_chat_id: []const u8,
+    agent_name: ?[]const u8 = null,
 };
 
 // ── SubagentManager ─────────────────────────────────────────────
@@ -112,8 +113,25 @@ pub const SubagentManager = struct {
         origin_channel: []const u8,
         origin_chat_id: []const u8,
     ) !u64 {
+        return self.spawnWithAgent(task, label, origin_channel, origin_chat_id, null);
+    }
+
+    /// Spawn a background subagent using an optional named agent profile.
+    /// When `agent_name` is set, provider/model/prompt are resolved from `agents.list`.
+    pub fn spawnWithAgent(
+        self: *SubagentManager,
+        task: []const u8,
+        label: []const u8,
+        origin_channel: []const u8,
+        origin_chat_id: []const u8,
+        agent_name: ?[]const u8,
+    ) !u64 {
         self.mutex.lock();
         defer self.mutex.unlock();
+
+        if (agent_name) |name| {
+            if (self.findAgent(name) == null) return error.UnknownAgent;
+        }
 
         if (self.getRunningCountLocked() >= self.config.max_concurrent)
             return error.TooManyConcurrentSubagents;
@@ -145,6 +163,8 @@ pub const SubagentManager = struct {
         errdefer self.allocator.free(origin_channel_copy);
         const origin_chat_copy = try self.allocator.dupe(u8, origin_chat_id);
         errdefer self.allocator.free(origin_chat_copy);
+        const agent_name_copy = if (agent_name) |name| try self.allocator.dupe(u8, name) else null;
+        errdefer if (agent_name_copy) |name| self.allocator.free(name);
 
         // Build thread context
         const ctx = try self.allocator.create(ThreadContext);
@@ -156,11 +176,19 @@ pub const SubagentManager = struct {
             .label = label_copy,
             .origin_channel = origin_channel_copy,
             .origin_chat_id = origin_chat_copy,
+            .agent_name = agent_name_copy,
         };
 
         state.thread = try std.Thread.spawn(.{ .stack_size = 2 * 1024 * 1024 }, subagentThreadFn, .{ctx});
 
         return task_id;
+    }
+
+    fn findAgent(self: *const SubagentManager, name: []const u8) ?config_mod.NamedAgentConfig {
+        for (self.agents) |agent| {
+            if (std.mem.eql(u8, agent.name, name)) return agent;
+        }
+        return null;
     }
 
     pub fn getTaskStatus(self: *SubagentManager, task_id: u64) ?TaskStatus {
@@ -253,23 +281,41 @@ fn subagentThreadFn(ctx: *ThreadContext) void {
         ctx.manager.allocator.free(ctx.label);
         ctx.manager.allocator.free(ctx.origin_channel);
         ctx.manager.allocator.free(ctx.origin_chat_id);
+        if (ctx.agent_name) |agent_name| ctx.manager.allocator.free(agent_name);
         ctx.manager.allocator.destroy(ctx);
     }
 
     // Use the legacy complete path — simple, works with any provider,
     // no need to replicate the full ProviderHolder pattern.
     // Build a config-like struct for providers.completeWithSystem().
-    const system_prompt = "You are a background subagent. Complete the assigned task concisely and accurately. You have no access to interactive tools — focus on reasoning and analysis.";
+    var system_prompt: []const u8 = "You are a background subagent. Complete the assigned task concisely and accurately. You have no access to interactive tools — focus on reasoning and analysis.";
+    var api_key = ctx.manager.api_key;
+    var default_provider = ctx.manager.default_provider;
+    var default_model = ctx.manager.default_model;
+    var temperature: f64 = 0.7;
+
+    if (ctx.agent_name) |agent_name| {
+        const agent_cfg = ctx.manager.findAgent(agent_name) orelse {
+            ctx.manager.completeTask(ctx.task_id, null, "UnknownAgent");
+            return;
+        };
+
+        default_provider = agent_cfg.provider;
+        default_model = agent_cfg.model;
+        api_key = agent_cfg.api_key orelse ctx.manager.api_key;
+        if (agent_cfg.system_prompt) |sp| system_prompt = sp;
+        if (agent_cfg.temperature) |t| temperature = t;
+    }
 
     var cfg_arena = std.heap.ArenaAllocator.init(ctx.manager.allocator);
     defer cfg_arena.deinit();
 
     // Build a config-like struct that providers.completeWithSystem() accepts
     const cfg = .{
-        .api_key = ctx.manager.api_key,
-        .default_provider = ctx.manager.default_provider,
-        .default_model = ctx.manager.default_model,
-        .temperature = @as(f64, 0.7),
+        .api_key = api_key,
+        .default_provider = default_provider,
+        .default_model = default_model,
+        .temperature = temperature,
         .max_tokens = @as(?u64, null),
     };
 
@@ -450,6 +496,40 @@ test "SubagentManager spawn stores session key" {
     const state = mgr.tasks.get(task_id) orelse return error.TestUnexpectedResult;
     try std.testing.expect(state.session_key != null);
     try std.testing.expectEqualStrings("session:42", state.session_key.?);
+}
+
+test "SubagentManager spawnWithAgent rejects unknown agent" {
+    const cfg = config_mod.Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var mgr = SubagentManager.init(std.testing.allocator, &cfg, null, .{});
+    defer mgr.deinit();
+
+    try std.testing.expectError(
+        error.UnknownAgent,
+        mgr.spawnWithAgent("quick task", "session-check", "agent", "session:42", "missing-agent"),
+    );
+}
+
+test "SubagentManager spawnWithAgent accepts configured agent" {
+    const agents = [_]config_mod.NamedAgentConfig{.{
+        .name = "researcher",
+        .provider = "openrouter",
+        .model = "anthropic/claude-sonnet-4",
+    }};
+    const cfg = config_mod.Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = std.testing.allocator,
+        .agents = &agents,
+    };
+    var mgr = SubagentManager.init(std.testing.allocator, &cfg, null, .{});
+    defer mgr.deinit();
+
+    const task_id = try mgr.spawnWithAgent("quick task", "session-check", "agent", "session:42", "researcher");
+    try std.testing.expect(task_id > 0);
 }
 
 test "SubagentManager spawn rollback removes task on out-of-memory" {
