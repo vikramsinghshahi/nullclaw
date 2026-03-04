@@ -7,6 +7,7 @@
 //!   - Discord (WebSocket gateway)
 //!   - Slack (socket/http event pipeline)
 //!   - WhatsApp (webhook-based)
+//!   - WhatsApp Web (sidecar bridge polling)
 //!   - Matrix (long-polling /sync)
 //!   - Mattermost (WebSocket + REST API)
 //!   - IRC (TLS socket)
@@ -136,6 +137,20 @@ pub const telegram = @import("telegram.zig");
 pub const discord = @import("discord.zig");
 pub const slack = @import("slack.zig");
 pub const whatsapp = @import("whatsapp.zig");
+pub const whatsapp_web = if (@import("build_options").enable_channel_whatsapp_web)
+    @import("whatsapp_web.zig")
+else
+    struct {
+        pub const WhatsAppWebChannel = struct {
+            pub fn initFromConfig(_: @import("std").mem.Allocator, _: anytype) @This() {
+                return .{};
+            }
+            pub fn channel(_: *@This()) Channel {
+                unreachable;
+            }
+            pub fn setBus(_: *@This(), _: anytype) void {}
+        };
+    };
 pub const matrix = @import("matrix.zig");
 pub const mattermost = @import("mattermost.zig");
 pub const irc = @import("irc.zig");

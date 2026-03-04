@@ -12,6 +12,7 @@ pub const ChannelId = enum {
     matrix,
     mattermost,
     whatsapp,
+    whatsapp_web,
     irc,
     lark,
     dingtalk,
@@ -51,6 +52,7 @@ pub const known_channels = [_]ChannelMeta{
     .{ .id = .matrix, .key = "matrix", .label = "Matrix", .configured_message = "Matrix configured", .listener_mode = .polling },
     .{ .id = .mattermost, .key = "mattermost", .label = "Mattermost", .configured_message = "Mattermost configured", .listener_mode = .gateway_loop },
     .{ .id = .whatsapp, .key = "whatsapp", .label = "WhatsApp", .configured_message = "WhatsApp configured", .listener_mode = .webhook_only },
+    .{ .id = .whatsapp_web, .key = "whatsapp_web", .label = "WhatsApp Web", .configured_message = "WhatsApp Web configured", .listener_mode = .gateway_loop },
     .{ .id = .irc, .key = "irc", .label = "IRC", .configured_message = "IRC configured", .listener_mode = .gateway_loop },
     .{ .id = .lark, .key = "lark", .label = "Lark", .configured_message = "Lark configured", .listener_mode = .webhook_only },
     .{ .id = .dingtalk, .key = "dingtalk", .label = "DingTalk", .configured_message = "DingTalk configured", .listener_mode = .send_only },
@@ -75,6 +77,7 @@ pub fn isBuildEnabled(channel_id: ChannelId) bool {
         .matrix => build_options.enable_channel_matrix,
         .mattermost => build_options.enable_channel_mattermost,
         .whatsapp => build_options.enable_channel_whatsapp,
+        .whatsapp_web => build_options.enable_channel_whatsapp_web,
         .irc => build_options.enable_channel_irc,
         .lark => build_options.enable_channel_lark,
         .dingtalk => build_options.enable_channel_dingtalk,
@@ -99,6 +102,7 @@ pub fn isBuildEnabledByKey(comptime key: []const u8) bool {
     if (comptime std.mem.eql(u8, key, "matrix")) return build_options.enable_channel_matrix;
     if (comptime std.mem.eql(u8, key, "mattermost")) return build_options.enable_channel_mattermost;
     if (comptime std.mem.eql(u8, key, "whatsapp")) return build_options.enable_channel_whatsapp;
+    if (comptime std.mem.eql(u8, key, "whatsapp_web")) return build_options.enable_channel_whatsapp_web;
     if (comptime std.mem.eql(u8, key, "irc")) return build_options.enable_channel_irc;
     if (comptime std.mem.eql(u8, key, "lark")) return build_options.enable_channel_lark;
     if (comptime std.mem.eql(u8, key, "dingtalk")) return build_options.enable_channel_dingtalk;
@@ -124,6 +128,7 @@ pub fn configuredCount(cfg: *const Config, channel_id: ChannelId) usize {
         .matrix => cfg.channels.matrix.len,
         .mattermost => cfg.channels.mattermost.len,
         .whatsapp => cfg.channels.whatsapp.len,
+        .whatsapp_web => cfg.channels.whatsapp_web.len,
         .irc => cfg.channels.irc.len,
         .lark => cfg.channels.lark.len,
         .dingtalk => cfg.channels.dingtalk.len,
@@ -235,12 +240,19 @@ test "configuredCount handles array and optional channels" {
                     .verify_token = "c",
                 },
             },
+            .whatsapp_web = &[_]@import("config_types.zig").WhatsAppWebConfig{
+                .{
+                    .account_id = "wa-web",
+                    .bridge_url = "http://127.0.0.1:3301",
+                },
+            },
         },
     };
 
     try std.testing.expectEqual(@as(usize, 1), configuredCount(&cfg, .telegram));
     try std.testing.expectEqual(@as(usize, 2), configuredCount(&cfg, .qq));
     try std.testing.expectEqual(@as(usize, 1), configuredCount(&cfg, .whatsapp));
+    try std.testing.expectEqual(@as(usize, 1), configuredCount(&cfg, .whatsapp_web));
     try std.testing.expectEqual(@as(usize, 0), configuredCount(&cfg, .line));
 }
 

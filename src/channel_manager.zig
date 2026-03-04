@@ -24,6 +24,7 @@ const maixcam = channels_mod.maixcam;
 const slack = channels_mod.slack;
 const irc = channels_mod.irc;
 const web = channels_mod.web;
+const whatsapp_web = channels_mod.whatsapp_web;
 const Channel = channels_mod.Channel;
 
 const log = std.log.scoped(.channel_manager);
@@ -803,6 +804,13 @@ test "ChannelManager collectConfiguredChannels wires listener types accounts and
                     .verify_token = "wa-verify",
                 },
             },
+            .whatsapp_web = &[_]@import("config_types.zig").WhatsAppWebConfig{
+                .{
+                    .account_id = "wa-web-main",
+                    .bridge_url = "http://127.0.0.1:3301",
+                    .allow_from = &.{"*"},
+                },
+            },
             .line = &[_]@import("config_types.zig").LineConfig{
                 .{
                     .account_id = "line-main",
@@ -910,6 +918,10 @@ test "ChannelManager collectConfiguredChannels wires listener types accounts and
         expected_total += config.channels.whatsapp.len;
         expected_webhook_only += config.channels.whatsapp.len;
     }
+    if (channel_catalog.isBuildEnabled(.whatsapp_web)) {
+        expected_total += config.channels.whatsapp_web.len;
+        expected_gateway_loop += config.channels.whatsapp_web.len;
+    }
     if (channel_catalog.isBuildEnabled(.line)) {
         expected_total += config.channels.line.len;
         expected_webhook_only += config.channels.line.len;
@@ -965,6 +977,7 @@ test "ChannelManager collectConfiguredChannels wires listener types accounts and
     try expectEntryPresence(entries, "slack", "sl-main", channel_catalog.isBuildEnabled(.slack));
     try expectEntryPresence(entries, "maixcam", "cam-main", channel_catalog.isBuildEnabled(.maixcam));
     try expectEntryPresence(entries, "whatsapp", "wa-main", channel_catalog.isBuildEnabled(.whatsapp));
+    try expectEntryPresence(entries, "whatsapp_web", "wa-web-main", channel_catalog.isBuildEnabled(.whatsapp_web));
     try expectEntryPresence(entries, "line", "line-main", channel_catalog.isBuildEnabled(.line));
     try expectEntryPresence(entries, "lark", "lark-main", channel_catalog.isBuildEnabled(.lark));
     try expectEntryPresence(entries, "matrix", "mx-main", channel_catalog.isBuildEnabled(.matrix));
@@ -1031,6 +1044,13 @@ test "ChannelManager collectConfiguredChannels wires listener types accounts and
         try std.testing.expect(slack_ptr.policy.group == .allowlist);
         try std.testing.expectEqual(@as(usize, 1), slack_ptr.policy.allowlist.len);
         try std.testing.expectEqualStrings("slack-admin", slack_ptr.policy.allowlist[0]);
+    }
+
+    if (comptime channel_catalog.isBuildEnabledByKey("whatsapp_web")) {
+        const wa_web_entry = findEntryByNameAccount(entries, "whatsapp_web", "wa-web-main") orelse
+            return error.TestUnexpectedResult;
+        const wa_web_ptr: *whatsapp_web.WhatsAppWebChannel = @ptrCast(@alignCast(wa_web_entry.channel.ptr));
+        try std.testing.expect(wa_web_ptr.event_bus == &event_bus);
     }
 }
 

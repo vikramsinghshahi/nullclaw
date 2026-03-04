@@ -220,10 +220,22 @@ fn defaultWebAccount(config: *const Config, _: []const u8) ?[]const u8 {
     return null;
 }
 
+fn defaultWhatsAppWebAccount(config: *const Config, _: []const u8) ?[]const u8 {
+    if (config.channels.whatsappWebPrimary()) |wa| return wa.account_id;
+    return null;
+}
+
 fn deriveWebPeer(input: InboundRouteInput, _: InboundMetadata) ?agent_routing.PeerRef {
     // Web sessions are keyed by chat/session id to avoid cross-session collisions
     // when sender_id is unset or reused by clients.
     return .{ .kind = .direct, .id = input.chat_id };
+}
+
+fn deriveWhatsAppWebPeer(input: InboundRouteInput, meta: InboundMetadata) ?agent_routing.PeerRef {
+    if (meta.is_group orelse false) {
+        return .{ .kind = .group, .id = input.chat_id };
+    }
+    return .{ .kind = .direct, .id = input.sender_id };
 }
 
 pub const inbound_route_descriptors = [_]InboundRouteDescriptor{
@@ -271,6 +283,11 @@ pub const inbound_route_descriptors = [_]InboundRouteDescriptor{
         .channel_name = "web",
         .default_account_id = defaultWebAccount,
         .derive_peer = deriveWebPeer,
+    },
+    .{
+        .channel_name = "whatsapp_web",
+        .default_account_id = defaultWhatsAppWebAccount,
+        .derive_peer = deriveWhatsAppWebPeer,
     },
 };
 
@@ -336,6 +353,22 @@ test "web inbound routing uses chat session id for peer" {
 
     try std.testing.expectEqual(agent_routing.ChatType.direct, peer.kind);
     try std.testing.expectEqualStrings("session-42", peer.id);
+}
+
+test "findInboundRouteDescriptor finds whatsapp_web channel" {
+    const cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .whatsapp_web = &[_]@import("config_types.zig").WhatsAppWebConfig{
+                .{ .account_id = "wa-web-main", .bridge_url = "http://127.0.0.1:3301" },
+            },
+        },
+    };
+    if (@import("channel_catalog.zig").isBuildEnabledByKey("whatsapp_web")) {
+        try std.testing.expect(findInboundRouteDescriptor(&cfg, "whatsapp_web") != null);
+    }
 }
 
 test "findInboundRouteDescriptor supports custom maixcam names" {

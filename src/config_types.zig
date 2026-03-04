@@ -324,6 +324,20 @@ pub const WhatsAppConfig = struct {
     group_policy: []const u8 = "allowlist",
 };
 
+pub const WhatsAppWebConfig = struct {
+    account_id: []const u8 = "default",
+    /// HTTP bridge endpoint used by the WhatsApp Web sidecar.
+    /// Example: http://127.0.0.1:3301
+    bridge_url: []const u8 = "http://127.0.0.1:3301",
+    /// Optional bearer token sent to the sidecar bridge.
+    api_key: ?[]const u8 = null,
+    allow_from: []const []const u8 = &.{},
+    group_allow_from: []const []const u8 = &.{},
+    /// Supported values: "allowlist", "open", "disabled".
+    group_policy: []const u8 = "allowlist",
+    poll_interval_ms: u32 = 1500,
+};
+
 pub const IrcConfig = struct {
     account_id: []const u8 = "default",
     host: []const u8,
@@ -647,6 +661,7 @@ pub const ChannelsConfig = struct {
     matrix: []const MatrixConfig = &.{},
     mattermost: []const MattermostConfig = &.{},
     whatsapp: []const WhatsAppConfig = &.{},
+    whatsapp_web: []const WhatsAppWebConfig = &.{},
     irc: []const IrcConfig = &.{},
     lark: []const LarkConfig = &.{},
     dingtalk: []const DingTalkConfig = &.{},
@@ -697,6 +712,9 @@ pub const ChannelsConfig = struct {
     }
     pub fn whatsappPrimary(self: *const ChannelsConfig) ?WhatsAppConfig {
         return primaryAccount(WhatsAppConfig, self.whatsapp);
+    }
+    pub fn whatsappWebPrimary(self: *const ChannelsConfig) ?WhatsAppWebConfig {
+        return primaryAccount(WhatsAppWebConfig, self.whatsapp_web);
     }
     pub fn ircPrimary(self: *const ChannelsConfig) ?IrcConfig {
         return primaryAccount(IrcConfig, self.irc);

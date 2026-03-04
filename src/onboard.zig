@@ -896,7 +896,7 @@ pub fn memoryProfileForBackend(backend: []const u8) []const u8 {
 
 pub fn isWizardInteractiveChannel(channel_id: channel_catalog.ChannelId) bool {
     return switch (channel_id) {
-        .telegram, .discord, .slack, .webhook, .mattermost, .matrix, .signal, .nostr => true,
+        .telegram, .discord, .slack, .webhook, .mattermost, .matrix, .signal, .nostr, .whatsapp_web => true,
         else => false,
     };
 }
@@ -1009,6 +1009,7 @@ fn configureSingleChannel(
         .slack => configureSlackChannel(cfg, out, input_buf, prefix),
         .matrix => configureMatrixChannel(cfg, out, input_buf, prefix),
         .mattermost => configureMattermostChannel(cfg, out, input_buf, prefix),
+        .whatsapp_web => configureWhatsAppWebChannel(cfg, out, input_buf, prefix),
         .signal => configureSignalChannel(cfg, out, input_buf, prefix),
         .webhook => configureWebhookChannel(cfg, out, input_buf, prefix),
         .nostr => configureNostrChannel(cfg, out, input_buf, prefix),
@@ -1254,6 +1255,43 @@ fn configureWebhookChannel(cfg: *Config, out: *std.Io.Writer, input_buf: []u8, p
         .secret = if (secret_input.len > 0) try cfg.allocator.dupe(u8, secret_input) else null,
     };
     try out.print("{s}  -> Webhook configured\n", .{prefix});
+    return true;
+}
+
+fn configureWhatsAppWebChannel(cfg: *Config, out: *std.Io.Writer, input_buf: []u8, prefix: []const u8) !bool {
+    var bridge_url_buf: [512]u8 = undefined;
+    try out.print("{s}  WhatsApp Web bridge URL [http://127.0.0.1:3301]: ", .{prefix});
+    const bridge_url = prompt(out, &bridge_url_buf, "", "http://127.0.0.1:3301") orelse return false;
+    if (bridge_url.len == 0) {
+        try out.print("{s}  -> WhatsApp Web skipped\n", .{prefix});
+        return false;
+    }
+
+    try out.print("{s}  WhatsApp Web bridge API key (optional): ", .{prefix});
+    const api_key = prompt(out, input_buf, "", "") orelse return false;
+
+    try out.print("{s}  WhatsApp Web allow_from (phone IDs, comma-separated) [*]: ", .{prefix});
+    const allow_input = prompt(out, input_buf, "", "") orelse return false;
+    const allow_from = try parseTelegramAllowFrom(cfg.allocator, allow_input);
+
+    try out.print("{s}  WhatsApp Web group policy [allowlist/open/disabled] (default allowlist): ", .{prefix});
+    const group_policy_input = prompt(out, input_buf, "", "allowlist") orelse return false;
+    const group_policy = if (std.mem.eql(u8, group_policy_input, "open") or
+        std.mem.eql(u8, group_policy_input, "disabled"))
+        group_policy_input
+    else
+        "allowlist";
+
+    const accounts = try cfg.allocator.alloc(config_mod.WhatsAppWebConfig, 1);
+    accounts[0] = .{
+        .account_id = "default",
+        .bridge_url = try cfg.allocator.dupe(u8, bridge_url),
+        .api_key = if (api_key.len > 0) try cfg.allocator.dupe(u8, api_key) else null,
+        .allow_from = allow_from,
+        .group_policy = try cfg.allocator.dupe(u8, group_policy),
+    };
+    cfg.channels.whatsapp_web = accounts;
+    try out.print("{s}  -> WhatsApp Web configured\n", .{prefix});
     return true;
 }
 
@@ -2509,6 +2547,7 @@ test "isWizardInteractiveChannel includes supported onboarding channels" {
     try std.testing.expect(isWizardInteractiveChannel(.matrix));
     try std.testing.expect(isWizardInteractiveChannel(.signal));
     try std.testing.expect(isWizardInteractiveChannel(.nostr));
+    try std.testing.expect(isWizardInteractiveChannel(.whatsapp_web));
     try std.testing.expect(!isWizardInteractiveChannel(.whatsapp));
 }
 
