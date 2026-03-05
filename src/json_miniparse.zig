@@ -58,6 +58,23 @@ pub fn parseIntField(json: []const u8, key: []const u8) ?i64 {
     return std.fmt.parseInt(i64, after_key[start..i], 10) catch null;
 }
 
+/// Extract an unsigned integer field value from a JSON blob.
+pub fn parseUintField(json: []const u8, key: []const u8) ?u64 {
+    var needle_buf: [256]u8 = undefined;
+    const quoted_key = std.fmt.bufPrint(&needle_buf, "\"{s}\"", .{key}) catch return null;
+    const key_pos = std.mem.indexOf(u8, json, quoted_key) orelse return null;
+    const after_key = json[key_pos + quoted_key.len ..];
+
+    var i: usize = 0;
+    while (i < after_key.len and (after_key[i] == ' ' or after_key[i] == ':' or after_key[i] == '\t' or after_key[i] == '\n')) : (i += 1) {}
+
+    const start = i;
+    while (i < after_key.len and after_key[i] >= '0' and after_key[i] <= '9') : (i += 1) {}
+    if (i == start) return null;
+
+    return std.fmt.parseInt(u64, after_key[start..i], 10) catch null;
+}
+
 test "json_miniparse parseStringField basic" {
     const json = "{\"command\": \"echo hello\", \"other\": \"val\"}";
     const val = parseStringField(json, "command");
@@ -75,8 +92,13 @@ test "json_miniparse parseIntField supports signed numbers" {
     try std.testing.expectEqual(@as(i64, -7), parseIntField("{\"n\": -7}", "n").?);
 }
 
+test "json_miniparse parseUintField supports positive numbers" {
+    try std.testing.expectEqual(@as(u64, 42), parseUintField("{\"n\": 42}", "n").?);
+}
+
 test "json_miniparse missing fields return null" {
     try std.testing.expect(parseStringField("{\"x\":1}", "name") == null);
     try std.testing.expect(parseBoolField("{\"x\":1}", "enabled") == null);
     try std.testing.expect(parseIntField("{\"x\":1}", "n") == null);
+    try std.testing.expect(parseUintField("{\"x\":1}", "n") == null);
 }
