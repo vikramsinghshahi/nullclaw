@@ -12,8 +12,8 @@ COPY src/ src/
 COPY vendor/sqlite3/ vendor/sqlite3/
 
 ARG TARGETARCH
-RUN --mount=type=cache,target=/root/.cache/zig \
-    --mount=type=cache,target=/app/.zig-cache \
+RUN --mount=type=cache,id=zig-root-cache,target=/root/.cache/zig \
+    --mount=type=cache,id=zig-app-cache,target=/app/.zig-cache \
     set -eu; \
     arch="${TARGETARCH:-}"; \
     if [ -z "${arch}" ]; then \
