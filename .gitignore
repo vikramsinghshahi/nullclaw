@@ -18,6 +18,7 @@ result
 .direnv/
 .worktrees
 config.signal.json
+config.railway.json
 
 # IDE configurations
 .idea/

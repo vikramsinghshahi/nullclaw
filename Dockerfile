@@ -31,23 +31,14 @@ RUN --mount=type=cache,target=/root/.cache/zig \
     zig build -Dtarget="${zig_target}" -Doptimize=ReleaseSmall
 
 # ── Stage 2: Config Prep ─────────────────────────────────────
+# This stage expects a config.railway.json to be present at the repo root.
+# At build time we copy it into the location nullclaw expects (~/.nullclaw/config.json).
+# The real config.railway.json (with secrets) is ignored by git; see config.railway.example.json.
 FROM busybox:1.37 AS config
 
 RUN mkdir -p /nullclaw-data/.nullclaw /nullclaw-data/workspace
 
-RUN cat > /nullclaw-data/.nullclaw/config.json << 'EOF'
-{
-  "api_key": "",
-  "default_provider": "openrouter",
-  "default_model": "anthropic/claude-sonnet-4",
-  "default_temperature": 0.7,
-  "gateway": {
-    "port": 3000,
-    "host": "::",
-    "allow_public_bind": true
-  }
-}
-EOF
+COPY config.railway.json /nullclaw-data/.nullclaw/config.json
 
 # Default runtime runs as non-root (uid/gid 65534).
 # Keep writable ownership for HOME/workspace in safe mode.
