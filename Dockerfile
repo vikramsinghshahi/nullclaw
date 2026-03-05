@@ -12,9 +12,7 @@ COPY src/ src/
 COPY vendor/sqlite3/ vendor/sqlite3/
 
 ARG TARGETARCH
-RUN --mount=type=cache,id=zig-root-cache,target=/root/.cache/zig \
-    --mount=type=cache,id=zig-app-cache,target=/app/.zig-cache \
-    set -eu; \
+RUN set -eu; \
     arch="${TARGETARCH:-}"; \
     if [ -z "${arch}" ]; then \
       case "$(uname -m)" in \
