@@ -32,6 +32,7 @@ RUN set -eu; \
 # This stage bakes a minimal, non-secret default config into the image.
 # You can later override it by building your own image with a different config
 # or by mounting a volume at /nullclaw-data/.nullclaw.
+# Primary model set to deepseek-chat (cheaper); use /model in Telegram to switch if needed.
 FROM busybox:1.37 AS config
 
 RUN mkdir -p /nullclaw-data/.nullclaw /nullclaw-data/workspace
@@ -47,9 +48,13 @@ RUN cat > /nullclaw-data/.nullclaw/config.json << 'EOF'
   "agents": {
     "defaults": {
       "model": {
-        "primary": "openrouter/anthropic/claude-sonnet-4"
+        "primary": "openrouter/deepseek/deepseek-chat",
+        "fallback": "openrouter/openai/gpt-4o-mini"
       }
     }
+  },
+  "agent": {
+    "max_tool_iterations": 3
   },
   "channels": {
     "cli": true,
