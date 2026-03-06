@@ -52,7 +52,16 @@ RUN cat > /nullclaw-data/.nullclaw/config.json << 'EOF'
     }
   },
   "channels": {
-    "cli": true
+    "cli": true,
+    "telegram": {
+      "accounts": {
+        "main": {
+          "bot_token": "8661978832:AAF4eyspgR3GVIX2iA1P2JvNl_7X7ssvwYk",
+          "allow_from": ["yana_akam"],
+          "reply_in_private": true
+        }
+      }
+    }
   },
   "memory": {
     "backend": "markdown",
