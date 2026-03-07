@@ -135,6 +135,9 @@ pub const ShellTool = struct {
             return ToolResult{ .success = true, .output = try allocator.dupe(u8, "(no output)") };
         }
         defer allocator.free(result.stdout);
+        if (result.interrupted) {
+            return ToolResult{ .success = false, .output = "", .error_msg = "Interrupted by /stop" };
+        }
         if (result.exit_code != null) {
             const err_out = try allocator.dupe(u8, if (result.stderr.len > 0) result.stderr else "Command failed with non-zero exit code");
             return ToolResult{ .success = false, .output = "", .error_msg = err_out };
@@ -195,6 +198,26 @@ test "shell captures failing command" {
     defer if (result.output.len > 0) std.testing.allocator.free(result.output);
     defer if (result.error_msg) |e| std.testing.allocator.free(e);
     try std.testing.expect(!result.success);
+}
+
+test "shell reports interruption when cancel flag is set" {
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+
+    var st = ShellTool{ .workspace_dir = "." };
+    const t = st.tool();
+    const parsed = try root.parseTestArgs("{\"command\": \"sleep 5\"}");
+    defer parsed.deinit();
+
+    var cancel = std.atomic.Value(bool).init(true);
+    @import("process_util.zig").setThreadInterruptFlag(&cancel);
+    defer @import("process_util.zig").setThreadInterruptFlag(null);
+
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer if (result.output.len > 0) std.testing.allocator.free(result.output);
+
+    try std.testing.expect(!result.success);
+    try std.testing.expect(result.error_msg != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "Interrupted") != null);
 }
 
 test "shell missing command param" {
