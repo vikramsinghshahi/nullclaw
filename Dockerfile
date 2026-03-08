@@ -104,6 +104,8 @@ RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
 # Git identity for bot commits (git config is blocked by security policy; set here so commits work)
 RUN printf '[user]\nname = nullclaw-bot\nemail = bot@nullclaw.local\n' > /nullclaw-data/.gitconfig && chown 65534:65534 /nullclaw-data/.gitconfig
+# .ssh dir for entrypoint (deploy key); create as root then chown so runtime user 65534 can write key/config
+RUN mkdir -p /nullclaw-data/.ssh && chown 65534:65534 /nullclaw-data/.ssh
 
 ENV NULLCLAW_WORKSPACE=/nullclaw-data/workspace
 ENV HOME=/nullclaw-data
