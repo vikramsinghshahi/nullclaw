@@ -3,6 +3,13 @@
 
 Skills define _how_ tools work. This file is for _your_ specifics — the stuff that's unique to your setup.
 
+## Git: which tool to use
+
+- **Use the `shell` tool** for: `git init`, `git remote add`, `git push`, `git clone`. The `git_operations` tool does not support these.
+- **Use the `git_operations` tool** for: status, diff, log, branch, commit, add, checkout, stash.
+- Run git from the workspace directory: `/nullclaw-data/workspace` (or pass `cwd` to the shell tool).
+- For push over SSH, the deploy key is already configured in `~/.ssh`; use remote URL like `git@github.com:USER/REPO.git`.
+
 ## What Goes Here
 
 Things like:
