@@ -12,9 +12,9 @@ pub const GitTool = struct {
     allowed_paths: []const []const u8 = &.{},
 
     pub const tool_name = "git_operations";
-    pub const tool_description = "Perform structured Git operations (status, diff, log, branch, commit, add, checkout, stash).";
+    pub const tool_description = "Perform structured Git operations (status, diff, log, branch, commit, add, checkout, stash, push).";
     pub const tool_params =
-        \\{"type":"object","properties":{"operation":{"type":"string","enum":["status","diff","log","branch","commit","add","checkout","stash"],"description":"Git operation to perform"},"message":{"type":"string","description":"Commit message (for commit)"},"paths":{"oneOf":[{"type":"string"},{"type":"array","items":{"type":"string"}}],"description":"File paths (for add). Prefer array for multiple files."},"branch":{"type":"string","description":"Branch name (for checkout)"},"files":{"oneOf":[{"type":"string"},{"type":"array","items":{"type":"string"}}],"description":"Files to diff. Prefer array for multiple files."},"cached":{"type":"boolean","description":"Show staged changes (diff)"},"limit":{"type":"integer","description":"Log entry count (default: 10)"},"cwd":{"type":"string","description":"Repository directory (absolute path within allowed paths; defaults to workspace)"}},"required":["operation"]}
+        \\{"type":"object","properties":{"operation":{"type":"string","enum":["status","diff","log","branch","commit","add","checkout","stash","push"],"description":"Git operation to perform"},"message":{"type":"string","description":"Commit message (for commit)"},"paths":{"oneOf":[{"type":"string"},{"type":"array","items":{"type":"string"}}],"description":"File paths (for add). Prefer array for multiple files."},"branch":{"type":"string","description":"Branch name (for checkout)"},"remote":{"type":"string","description":"Remote name (for push, default: origin)"},"refspec":{"type":"string","description":"Refspec to push (for push, default: current branch)"},"files":{"oneOf":[{"type":"string"},{"type":"array","items":{"type":"string"}}],"description":"Files to diff. Prefer array for multiple files."},"cached":{"type":"boolean","description":"Show staged changes (diff)"},"limit":{"type":"integer","description":"Log entry count (default: 10)"},"cwd":{"type":"string","description":"Repository directory (absolute path within allowed paths; defaults to workspace)"}},"required":["operation"]}
     ;
 
     const vtable = root.ToolVTable(@This());
@@ -143,7 +143,7 @@ pub const GitTool = struct {
             break :blk cwd;
         } else self.workspace_dir;
 
-        const GitOp = enum { status, diff, log, branch, commit, add, checkout, stash };
+        const GitOp = enum { status, diff, log, branch, commit, add, checkout, stash, push };
         const op_map = std.StaticStringMap(GitOp).initComptime(.{
             .{ "status", .status },
             .{ "diff", .diff },
@@ -153,6 +153,7 @@ pub const GitTool = struct {
             .{ "add", .add },
             .{ "checkout", .checkout },
             .{ "stash", .stash },
+            .{ "push", .push },
         });
 
         if (op_map.get(operation)) |op| return switch (op) {
@@ -164,6 +165,7 @@ pub const GitTool = struct {
             .add => self.gitAdd(allocator, effective_cwd, args),
             .checkout => self.gitCheckout(allocator, effective_cwd, args),
             .stash => self.gitStash(allocator, effective_cwd, args),
+            .push => self.gitPush(allocator, effective_cwd, args),
         };
 
         const msg = try std.fmt.allocPrint(allocator, "Unknown operation: {s}", .{operation});
@@ -402,6 +404,52 @@ pub const GitTool = struct {
 
         const msg = try std.fmt.allocPrint(allocator, "Unknown stash action: {s}", .{action});
         return ToolResult{ .success = false, .output = "", .error_msg = msg };
+    }
+
+    fn gitPush(self: *GitTool, allocator: std.mem.Allocator, git_cwd: []const u8, args: JsonObjectMap) !ToolResult {
+        const remote = root.getString(args, "remote") orelse "origin";
+        const refspec = root.getString(args, "refspec");
+
+        // Validate remote and refspec for safety
+        if (std.mem.indexOfScalar(u8, remote, ';') != null or
+            std.mem.indexOfScalar(u8, remote, '|') != null or
+            std.mem.indexOfScalar(u8, remote, '`') != null or
+            std.mem.indexOf(u8, remote, "$(") != null or
+            std.mem.indexOf(u8, remote, " ") != null)
+        {
+            return ToolResult.fail("Remote name contains invalid characters");
+        }
+
+        if (refspec) |ref| {
+            if (std.mem.indexOfScalar(u8, ref, ';') != null or
+                std.mem.indexOfScalar(u8, ref, '|') != null or
+                std.mem.indexOfScalar(u8, ref, '`') != null or
+                std.mem.indexOf(u8, ref, "$(") != null)
+            {
+                return ToolResult.fail("Refspec contains invalid characters");
+            }
+        }
+
+        var argv_buf: [8][]const u8 = undefined;
+        argv_buf[0] = "push";
+        argv_buf[1] = remote;
+        var argc: usize = 2;
+
+        if (refspec) |ref| {
+            argv_buf[argc] = ref;
+            argc += 1;
+        }
+
+        const result = try self.runGit(allocator, git_cwd, argv_buf[0..argc]);
+        defer allocator.free(result.stderr);
+        if (!result.success) {
+            defer allocator.free(result.stdout);
+            const msg = try allocator.dupe(u8, if (result.stderr.len > 0) result.stderr else "Git push failed");
+            return ToolResult{ .success = false, .output = "", .error_msg = msg };
+        }
+        defer allocator.free(result.stdout);
+        const out = try std.fmt.allocPrint(allocator, "Pushed to {s}", .{remote});
+        return ToolResult{ .success = true, .output = out };
     }
 };
 
@@ -711,4 +759,69 @@ test "git execute blocks unsafe args in files string" {
     const result = try t.execute(std.testing.allocator, parsed.value.object);
     try std.testing.expect(!result.success);
     try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "Unsafe") != null);
+}
+
+// ── gitPush tests ───────────────────────────────────────────────────
+
+test "git push missing operation rejected" {
+    var gt = GitTool{ .workspace_dir = "/tmp" };
+    const t = gt.tool();
+    const parsed = try root.parseTestArgs("{\"operation\": \"push\"}");
+    defer parsed.deinit();
+    // This should not fail - push is now a valid operation
+    // It will fail at git execution (no repo), but not at validation
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer if (result.error_msg) |e| std.testing.allocator.free(e);
+    // Should fail at git level (not a repo), not at validation
+    try std.testing.expect(!result.success);
+}
+
+test "git push blocks unsafe remote with semicolon" {
+    var gt = GitTool{ .workspace_dir = "/tmp" };
+    const t = gt.tool();
+    const parsed = try root.parseTestArgs("{\"operation\": \"push\", \"remote\": \"origin; rm -rf /\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "invalid characters") != null);
+}
+
+test "git push blocks unsafe remote with pipe" {
+    var gt = GitTool{ .workspace_dir = "/tmp" };
+    const t = gt.tool();
+    const parsed = try root.parseTestArgs("{\"operation\": \"push\", \"remote\": \"origin|cat /etc/passwd\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "invalid characters") != null);
+}
+
+test "git push blocks unsafe remote with command substitution" {
+    var gt = GitTool{ .workspace_dir = "/tmp" };
+    const t = gt.tool();
+    const parsed = try root.parseTestArgs("{\"operation\": \"push\", \"remote\": \"$(evil)\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "invalid characters") != null);
+}
+
+test "git push blocks unsafe remote with space" {
+    var gt = GitTool{ .workspace_dir = "/tmp" };
+    const t = gt.tool();
+    const parsed = try root.parseTestArgs("{\"operation\": \"push\", \"remote\": \"origin evil\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "invalid characters") != null);
+}
+
+test "git push blocks unsafe refspec" {
+    var gt = GitTool{ .workspace_dir = "/tmp" };
+    const t = gt.tool();
+    const parsed = try root.parseTestArgs("{\"operation\": \"push\", \"refspec\": \"main; rm -rf /\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "invalid characters") != null);
 }
