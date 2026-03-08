@@ -75,7 +75,7 @@ RUN cat > /nullclaw-data/.nullclaw/config.json << 'EOF'
   "autonomy": {
     "level": "full",
     "workspace_only": true,
-    "allowed_commands": ["git", "git *", "ls", "cat", "echo", "pwd", "mkdir", "mv", "cp"],
+    "allowed_commands": ["git", "git *", "ls", "cat", "echo", "pwd", "mkdir", "mv", "cp","bash","sh","curl","wget","ssh","scp","sftp","ftp","telnet","nc","ncat","netcat","telnet","ssh","scp","sftp","ftp","telnet","nc","ncat","netcat"],
     "allowed_paths": ["/nullclaw-data/workspace"]
   },
   "gateway": {
