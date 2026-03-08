@@ -72,6 +72,12 @@ RUN cat > /nullclaw-data/.nullclaw/config.json << 'EOF'
     "backend": "markdown",
     "auto_save": true
   },
+  "autonomy": {
+    "level": "full",
+    "workspace_only": true,
+    "allowed_commands": ["git", "git *", "ls", "cat", "echo", "pwd", "mkdir", "mv", "cp"],
+    "allowed_paths": ["/nullclaw-data/workspace"]
+  },
   "gateway": {
     "port": 3000,
     "host": "::",
@@ -89,10 +95,15 @@ FROM alpine:3.23 AS release-base
 
 LABEL org.opencontainers.image.source=https://github.com/nullclaw/nullclaw
 
-RUN apk add --no-cache ca-certificates curl tzdata
+RUN apk add --no-cache ca-certificates curl tzdata git openssh-client
 
 COPY --from=builder /app/zig-out/bin/nullclaw /usr/local/bin/nullclaw
 COPY --from=config /nullclaw-data /nullclaw-data
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+
+# Git identity for bot commits (git config is blocked by security policy; set here so commits work)
+RUN printf '[user]\nname = nullclaw-bot\nemail = bot@nullclaw.local\n' > /nullclaw-data/.gitconfig && chown 65534:65534 /nullclaw-data/.gitconfig
 
 ENV NULLCLAW_WORKSPACE=/nullclaw-data/workspace
 ENV HOME=/nullclaw-data
@@ -100,7 +111,7 @@ ENV NULLCLAW_GATEWAY_PORT=3000
 
 WORKDIR /nullclaw-data
 EXPOSE 3000
-ENTRYPOINT ["nullclaw"]
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["gateway", "--port", "3000", "--host", "::"]
 
 # Optional autonomous mode (explicit opt-in):
