@@ -12,9 +12,9 @@ pub const GitTool = struct {
     allowed_paths: []const []const u8 = &.{},
 
     pub const tool_name = "git_operations";
-    pub const tool_description = "Perform structured Git operations (status, diff, log, branch, commit, add, checkout, stash, push).";
+    pub const tool_description = "Perform structured Git operations (status, diff, log, branch, commit, add, checkout, stash, push, configure_credentials). Use configure_credentials first to set up GitHub authentication before pushing.";
     pub const tool_params =
-        \\{"type":"object","properties":{"operation":{"type":"string","enum":["status","diff","log","branch","commit","add","checkout","stash","push"],"description":"Git operation to perform"},"message":{"type":"string","description":"Commit message (for commit)"},"paths":{"oneOf":[{"type":"string"},{"type":"array","items":{"type":"string"}}],"description":"File paths (for add). Prefer array for multiple files."},"branch":{"type":"string","description":"Branch name (for checkout)"},"remote":{"type":"string","description":"Remote name (for push, default: origin)"},"refspec":{"type":"string","description":"Refspec to push (for push, default: current branch)"},"files":{"oneOf":[{"type":"string"},{"type":"array","items":{"type":"string"}}],"description":"Files to diff. Prefer array for multiple files."},"cached":{"type":"boolean","description":"Show staged changes (diff)"},"limit":{"type":"integer","description":"Log entry count (default: 10)"},"cwd":{"type":"string","description":"Repository directory (absolute path within allowed paths; defaults to workspace)"}},"required":["operation"]}
+        \\{"type":"object","properties":{"operation":{"type":"string","enum":["status","diff","log","branch","commit","add","checkout","stash","push","configure_credentials"],"description":"Git operation to perform"},"message":{"type":"string","description":"Commit message (for commit)"},"paths":{"oneOf":[{"type":"string"},{"type":"array","items":{"type":"string"}}],"description":"File paths (for add). Prefer array for multiple files."},"branch":{"type":"string","description":"Branch name (for checkout)"},"remote":{"type":"string","description":"Remote name (for push, default: origin)"},"refspec":{"type":"string","description":"Refspec to push (for push, default: current branch)"},"files":{"oneOf":[{"type":"string"},{"type":"array","items":{"type":"string"}}],"description":"Files to diff. Prefer array for multiple files."},"cached":{"type":"boolean","description":"Show staged changes (diff)"},"limit":{"type":"integer","description":"Log entry count (default: 10)"},"cwd":{"type":"string","description":"Repository directory (absolute path within allowed paths; defaults to workspace)"},"token":{"type":"string","description":"GitHub token (for configure_credentials, defaults to GITHUB_TOKEN env var)"},"username":{"type":"string","description":"GitHub username (for configure_credentials, defaults to GITHUB_USER env var)"}},"required":["operation"]}
     ;
 
     const vtable = root.ToolVTable(@This());
@@ -143,7 +143,7 @@ pub const GitTool = struct {
             break :blk cwd;
         } else self.workspace_dir;
 
-        const GitOp = enum { status, diff, log, branch, commit, add, checkout, stash, push };
+        const GitOp = enum { status, diff, log, branch, commit, add, checkout, stash, push, configure_credentials };
         const op_map = std.StaticStringMap(GitOp).initComptime(.{
             .{ "status", .status },
             .{ "diff", .diff },
@@ -154,6 +154,7 @@ pub const GitTool = struct {
             .{ "checkout", .checkout },
             .{ "stash", .stash },
             .{ "push", .push },
+            .{ "configure_credentials", .configure_credentials },
         });
 
         if (op_map.get(operation)) |op| return switch (op) {
@@ -166,6 +167,7 @@ pub const GitTool = struct {
             .checkout => self.gitCheckout(allocator, effective_cwd, args),
             .stash => self.gitStash(allocator, effective_cwd, args),
             .push => self.gitPush(allocator, effective_cwd, args),
+            .configure_credentials => self.gitConfigureCredentials(allocator, effective_cwd, args),
         };
 
         const msg = try std.fmt.allocPrint(allocator, "Unknown operation: {s}", .{operation});
@@ -449,6 +451,91 @@ pub const GitTool = struct {
         }
         defer allocator.free(result.stdout);
         const out = try std.fmt.allocPrint(allocator, "Pushed to {s}", .{remote});
+        return ToolResult{ .success = true, .output = out };
+    }
+
+    /// Configure git credentials for HTTPS authentication with GitHub.
+    /// Reads GITHUB_TOKEN and GITHUB_USER from environment variables if not provided.
+    /// Sets up credential helper and stores credentials in ~/.git-credentials.
+    fn gitConfigureCredentials(self: *GitTool, allocator: std.mem.Allocator, git_cwd: []const u8, args: JsonObjectMap) !ToolResult {
+        const platform = @import("../platform.zig");
+        
+        // Get token from args or environment
+        const token = if (root.getString(args, "token")) |t| t else blk: {
+            const env_token = platform.getEnvOrNull(allocator, "GITHUB_TOKEN") catch null;
+            defer if (env_token) |v| allocator.free(v);
+            break :blk env_token orelse return ToolResult.fail("GitHub token not provided and GITHUB_TOKEN environment variable not set");
+        };
+
+        // Get username from args or environment
+        const username = if (root.getString(args, "username")) |u| u else blk: {
+            const env_user = platform.getEnvOrNull(allocator, "GITHUB_USER") catch null;
+            defer if (env_user) |v| allocator.free(v);
+            break :blk env_user orelse return ToolResult.fail("GitHub username not provided and GITHUB_USER environment variable not set");
+        };
+
+        // Validate token and username for safety
+        if (std.mem.indexOfScalar(u8, token, ';') != null or
+            std.mem.indexOfScalar(u8, token, '|') != null or
+            std.mem.indexOfScalar(u8, token, '`') != null or
+            std.mem.indexOf(u8, token, "$(") != null)
+        {
+            return ToolResult.fail("Token contains invalid characters");
+        }
+
+        if (std.mem.indexOfScalar(u8, username, ';') != null or
+            std.mem.indexOfScalar(u8, username, '|') != null or
+            std.mem.indexOfScalar(u8, username, '`') != null or
+            std.mem.indexOf(u8, username, "$(") != null or
+            std.mem.indexOfScalar(u8, username, '/') != null or
+            std.mem.indexOfScalar(u8, username, '\\') != null)
+        {
+            return ToolResult.fail("Username contains invalid characters");
+        }
+
+        // Step 1: Configure credential helper to store
+        const helper_result = try self.runGit(allocator, git_cwd, &.{ "config", "--global", "credential.helper", "store" });
+        defer allocator.free(helper_result.stderr);
+        defer allocator.free(helper_result.stdout);
+        if (!helper_result.success) {
+            const msg = try allocator.dupe(u8, "Failed to configure git credential helper");
+            return ToolResult{ .success = false, .output = "", .error_msg = msg };
+        }
+
+        // Step 2: Store credentials using git credential fill and approve
+        // We'll use a simpler approach: write to ~/.git-credentials directly
+        const home = platform.getEnvOrNull(allocator, "HOME") catch null;
+        defer if (home) |h| allocator.free(h);
+        
+        if (home == null) {
+            return ToolResult.fail("HOME environment variable not set");
+        }
+
+        // Build credentials file path: ~/.git-credentials
+        const creds_path = try std.fs.path.join(allocator, &.{ home.?, ".git-credentials" });
+        defer allocator.free(creds_path);
+
+        // Build credentials line: https://username:token@github.com
+        var creds_line = std.ArrayListUnmanaged(u8).empty;
+        defer creds_line.deinit(allocator);
+        try creds_line.appendSlice(allocator, "https://");
+        try creds_line.appendSlice(allocator, username);
+        try creds_line.appendSlice(allocator, ":");
+        try creds_line.appendSlice(allocator, token);
+        try creds_line.appendSlice(allocator, "@github.com");
+        try creds_line.appendSlice(allocator, "\n");
+
+        // Write to credentials file
+        var creds_file = try std.fs.cwd().createFile(creds_path, .{
+            .mode = 0o600, // Read/write for owner only
+            .truncate = false,
+            .exclusive = false,
+        });
+        defer creds_file.close();
+        try creds_file.writeAll(creds_line.items);
+        try creds_file.sync();
+
+        const out = try std.fmt.allocPrint(allocator, "Git credentials configured for {s}", .{username});
         return ToolResult{ .success = true, .output = out };
     }
 };
@@ -820,6 +907,50 @@ test "git push blocks unsafe refspec" {
     var gt = GitTool{ .workspace_dir = "/tmp" };
     const t = gt.tool();
     const parsed = try root.parseTestArgs("{\"operation\": \"push\", \"refspec\": \"main; rm -rf /\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "invalid characters") != null);
+}
+
+// ── gitConfigureCredentials tests ───────────────────────────────────
+
+test "git configure_credentials missing token and env var" {
+    var gt = GitTool{ .workspace_dir = "/tmp" };
+    const t = gt.tool();
+    // No token provided, no env var set
+    const parsed = try root.parseTestArgs("{\"operation\": \"configure_credentials\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "GITHUB_TOKEN") != null);
+}
+
+test "git configure_credentials missing username and env var" {
+    var gt = GitTool{ .workspace_dir = "/tmp" };
+    const t = gt.tool();
+    // Token provided but no username, no env var
+    const parsed = try root.parseTestArgs("{\"operation\": \"configure_credentials\", \"token\": \"ghp_test123\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "GITHUB_USER") != null);
+}
+
+test "git configure_credentials blocks unsafe token" {
+    var gt = GitTool{ .workspace_dir = "/tmp" };
+    const t = gt.tool();
+    const parsed = try root.parseTestArgs("{\"operation\": \"configure_credentials\", \"token\": \"ghp_test;rm -rf /\", \"username\": \"testuser\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "invalid characters") != null);
+}
+
+test "git configure_credentials blocks unsafe username with slash" {
+    var gt = GitTool{ .workspace_dir = "/tmp" };
+    const t = gt.tool();
+    const parsed = try root.parseTestArgs("{\"operation\": \"configure_credentials\", \"token\": \"ghp_test123\", \"username\": \"test/user\"}");
     defer parsed.deinit();
     const result = try t.execute(std.testing.allocator, parsed.value.object);
     try std.testing.expect(!result.success);
