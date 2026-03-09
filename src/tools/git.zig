@@ -462,14 +462,14 @@ pub const GitTool = struct {
         
         // Get token from args or environment
         const token = if (root.getString(args, "token")) |t| t else blk: {
-            const env_token = platform.getEnvOrNull(allocator, "GITHUB_TOKEN") catch null;
+            const env_token = platform.getEnvOrNull(allocator, "GITHUB_TOKEN");
             defer if (env_token) |v| allocator.free(v);
             break :blk env_token orelse return ToolResult.fail("GitHub token not provided and GITHUB_TOKEN environment variable not set");
         };
 
         // Get username from args or environment
         const username = if (root.getString(args, "username")) |u| u else blk: {
-            const env_user = platform.getEnvOrNull(allocator, "GITHUB_USER") catch null;
+            const env_user = platform.getEnvOrNull(allocator, "GITHUB_USER");
             defer if (env_user) |v| allocator.free(v);
             break :blk env_user orelse return ToolResult.fail("GitHub username not provided and GITHUB_USER environment variable not set");
         };
@@ -504,7 +504,7 @@ pub const GitTool = struct {
 
         // Step 2: Store credentials using git credential fill and approve
         // We'll use a simpler approach: write to ~/.git-credentials directly
-        const home = platform.getEnvOrNull(allocator, "HOME") catch null;
+        const home = platform.getEnvOrNull(allocator, "HOME");
         defer if (home) |h| allocator.free(h);
         
         if (home == null) {
