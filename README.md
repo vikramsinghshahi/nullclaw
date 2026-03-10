@@ -485,7 +485,7 @@ Use this when you want full web-search provider control plus unrestricted shell 
 }
 ```
 
-- `http_request.search_base_url` accepts either instance root (`https://host`) or explicit endpoint (`https://host/search`).
+- `http_request.search_base_url` accepts either instance root (`https://host`) or explicit endpoint (`https://host/search`); local/private SearXNG instances may also use plain HTTP such as `http://localhost:8888` or `http://192.168.1.10:8888/search`.
 - Invalid `http_request.search_base_url` now fails config validation at startup (no automatic fallback for malformed URL).
 - `http_request.search_provider` supports: `auto`, `searxng`, `duckduckgo` (`ddg`), `brave`, `firecrawl`, `tavily`, `perplexity`, `exa`, `jina`.
 - `http_request.search_fallback_providers` is optional and is tried in order when the primary provider fails.

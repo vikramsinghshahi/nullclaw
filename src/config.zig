@@ -982,7 +982,7 @@ pub const Config = struct {
             ValidationError.InvalidBackoffMs => std.debug.print("Config error: provider_backoff_ms must be <= 600000.\n", .{}),
             ValidationError.InvalidHttpProxyUrl => std.debug.print("Config error: http_request.proxy must be a non-empty http://, https://, or socks5:// URL.\n", .{}),
             ValidationError.InvalidApiErrorMaxChars => std.debug.print("Config error: diagnostics.api_error_max_chars must be in [200, 10000].\n", .{}),
-            ValidationError.InvalidHttpSearchBaseUrl => std.debug.print("Config error: http_request.search_base_url must be http(s)://host or http(s)://host/search (no query/fragment).\n", .{}),
+            ValidationError.InvalidHttpSearchBaseUrl => std.debug.print("Config error: http_request.search_base_url must be https://host[/search] or local http://host[:port][/search] (no query/fragment).\n", .{}),
             ValidationError.InvalidHttpSearchProvider => std.debug.print("Config error: http_request.search_provider must be one of: auto, searxng, duckduckgo(ddg), brave, firecrawl, tavily, perplexity, exa, jina.\n", .{}),
             ValidationError.InvalidHttpSearchFallbackProvider => std.debug.print("Config error: http_request.search_fallback_providers entries must be valid providers and cannot be 'auto'.\n", .{}),
             ValidationError.InvalidWebTransport => std.debug.print("Config error: channels.web.accounts.<id>.transport must be 'local' or 'relay'.\n", .{}),
@@ -1956,6 +1956,28 @@ test "validation accepts valid http_request search base URL" {
     };
     cfg.http_request.search_base_url = "https://searx.example.com/search";
     try cfg.validate();
+}
+
+test "validation accepts local http_request search base URL" {
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "x",
+        .allocator = std.testing.allocator,
+    };
+    cfg.http_request.search_base_url = "http://localhost:8888/search";
+    try cfg.validate();
+}
+
+test "validation rejects remote http_request search base URL over plain http" {
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "x",
+        .allocator = std.testing.allocator,
+    };
+    cfg.http_request.search_base_url = "http://searx.example.com/search";
+    try std.testing.expectError(Config.ValidationError.InvalidHttpSearchBaseUrl, cfg.validate());
 }
 
 test "validation rejects invalid http_request search provider" {

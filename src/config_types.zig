@@ -1,4 +1,5 @@
 const std = @import("std");
+const search_base_url = @import("search_base_url.zig");
 
 /// Default context token budget used by agent compaction/context management.
 /// Runtime fallback (`DEFAULT_CONTEXT_TOKENS`).
@@ -1092,9 +1093,11 @@ pub const HttpRequestConfig = struct {
     proxy: ?[]const u8 = null,
     /// Optional SearXNG instance URL used by web_search as a fallback when
     /// BRAVE_API_KEY is not available.
+    /// HTTPS is allowed for any host. Plain HTTP is allowed only for local or
+    /// private hosts such as localhost, .local names, or private IP ranges.
     /// Examples:
     ///   - "https://searx.example.com"
-    ///   - "http://searx.example.com"
+    ///   - "http://localhost:8888"
     ///   - "https://searx.example.com/search"
     search_base_url: ?[]const u8 = null,
     /// Search provider for web_search.
@@ -1106,37 +1109,12 @@ pub const HttpRequestConfig = struct {
 
     /// Validate optional SearXNG base URL accepted by web_search.
     /// Allowed forms:
-    ///   - http://host  or https://host
-    ///   - http://host/ or https://host/
-    ///   - http://host/search  or https://host/search
-    ///   - http://host/search/ or https://host/search/
+    ///   - https://host
+    ///   - https://host/search
+    ///   - http://localhost[:port]
+    ///   - http://localhost[:port]/search
     pub fn isValidSearchBaseUrl(raw: []const u8) bool {
-        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
-        const scheme_len = if (std.mem.startsWith(u8, trimmed, "https://"))
-            "https://".len
-        else if (std.mem.startsWith(u8, trimmed, "http://"))
-            "http://".len
-        else
-            return false;
-        if (std.mem.indexOfAny(u8, trimmed, "?#") != null) return false;
-
-        const no_scheme = trimmed[scheme_len..];
-        if (no_scheme.len == 0 or no_scheme[0] == '/') return false;
-
-        const slash_pos = std.mem.indexOfScalar(u8, no_scheme, '/');
-        const authority = if (slash_pos) |idx| no_scheme[0..idx] else no_scheme;
-        if (authority.len == 0) return false;
-        if (std.mem.indexOfAny(u8, authority, " \t\r\n")) |_| return false;
-
-        if (slash_pos) |idx| {
-            var path = no_scheme[idx..];
-            if (std.mem.eql(u8, path, "/")) return true;
-            while (path.len > 1 and path[path.len - 1] == '/') {
-                path = path[0 .. path.len - 1];
-            }
-            if (!std.mem.eql(u8, path, "/search")) return false;
-        }
-        return true;
+        return search_base_url.isValid(raw);
     }
 
     pub fn isValidSearchProviderName(raw: []const u8) bool {
@@ -1486,17 +1464,22 @@ test "HttpRequestConfig search base URL validation" {
     try std.testing.expect(HttpRequestConfig.isValidSearchBaseUrl("https://searx.example.com/search"));
     try std.testing.expect(HttpRequestConfig.isValidSearchBaseUrl("https://searx.example.com/search/"));
 
-    try std.testing.expect(HttpRequestConfig.isValidSearchBaseUrl("http://searx.example.com"));
-    try std.testing.expect(HttpRequestConfig.isValidSearchBaseUrl("http://searx.example.com/"));
-    try std.testing.expect(HttpRequestConfig.isValidSearchBaseUrl("http://searx.example.com/search"));
-    try std.testing.expect(HttpRequestConfig.isValidSearchBaseUrl("http://searx.example.com/search/"));
+    try std.testing.expect(HttpRequestConfig.isValidSearchBaseUrl("http://localhost:8888"));
+    try std.testing.expect(HttpRequestConfig.isValidSearchBaseUrl("http://localhost:8888/"));
+    try std.testing.expect(HttpRequestConfig.isValidSearchBaseUrl("http://localhost:8888/search"));
+    try std.testing.expect(HttpRequestConfig.isValidSearchBaseUrl("http://localhost:8888/search/"));
+    try std.testing.expect(HttpRequestConfig.isValidSearchBaseUrl("http://192.168.1.10:8888/search"));
+    try std.testing.expect(HttpRequestConfig.isValidSearchBaseUrl("http://searx.local/search"));
 
     try std.testing.expect(!HttpRequestConfig.isValidSearchBaseUrl("ftp://searx.example.com"));
     try std.testing.expect(!HttpRequestConfig.isValidSearchBaseUrl("https://"));
     try std.testing.expect(!HttpRequestConfig.isValidSearchBaseUrl("http://"));
+    try std.testing.expect(!HttpRequestConfig.isValidSearchBaseUrl("http://searx.example.com"));
+    try std.testing.expect(!HttpRequestConfig.isValidSearchBaseUrl("http://searx.example.com/search"));
     try std.testing.expect(!HttpRequestConfig.isValidSearchBaseUrl("https://searx.example.com?x=1"));
     try std.testing.expect(!HttpRequestConfig.isValidSearchBaseUrl("https://searx.example.com#frag"));
     try std.testing.expect(!HttpRequestConfig.isValidSearchBaseUrl("https://searx.example.com/custom"));
+    try std.testing.expect(!HttpRequestConfig.isValidSearchBaseUrl("https://:8080/search"));
 }
 
 test "HttpRequestConfig search provider validation" {
