@@ -36,7 +36,7 @@ NullClaw 当前提供官方 OCI 镜像：`ghcr.io/nullclaw/nullclaw`。
 
 容器内的持久化目录统一放在 `/nullclaw-data`：
 
-- 配置文件：`/nullclaw-data/.nullclaw/config.json`
+- 配置文件：`/nullclaw-data/config.json`
 - 工作区：`/nullclaw-data/workspace`
 
 ### 单次命令
@@ -67,7 +67,7 @@ docker run --rm -it \
 
 ```bash
 docker run --rm -it \
-  -p 3000:3000 \
+  -p 127.0.0.1:3000:3000 \
   -v nullclaw-data:/nullclaw-data \
   ghcr.io/nullclaw/nullclaw:latest
 ```
@@ -97,7 +97,9 @@ docker compose --profile gateway up -d gateway
 Profile 含义：
 
 - `agent`：一次性的交互式 CLI 容器
-- `gateway`：长期运行的 HTTP gateway，默认监听 `3000`
+- `gateway`：长期运行的 HTTP gateway，默认发布到宿主机回环地址 `3000`
+
+如果你需要局域网或公网访问，请显式修改发布地址，并先阅读 [安全指南](./security.md)。
 
 如果你要固定版本标签，或者以后切换到其他镜像仓库，可以覆盖 `NULLCLAW_IMAGE`：
 

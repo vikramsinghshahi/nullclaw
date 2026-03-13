@@ -50,7 +50,7 @@ NullClaw publishes an official OCI image at `ghcr.io/nullclaw/nullclaw`.
 
 The container stores its persistent state under `/nullclaw-data`:
 
-- config: `/nullclaw-data/.nullclaw/config.json`
+- config: `/nullclaw-data/config.json`
 - workspace: `/nullclaw-data/workspace`
 
 ### Quick one-off commands
@@ -81,7 +81,7 @@ Run the HTTP gateway:
 
 ```bash
 docker run --rm -it \
-  -p 3000:3000 \
+  -p 127.0.0.1:3000:3000 \
   -v nullclaw-data:/nullclaw-data \
   ghcr.io/nullclaw/nullclaw:latest
 ```
@@ -111,7 +111,9 @@ docker compose --profile gateway up -d gateway
 Profile behavior:
 
 - `agent`: one-off interactive CLI container
-- `gateway`: long-running HTTP gateway on port `3000`
+- `gateway`: long-running HTTP gateway published on host loopback port `3000`
+
+If you need LAN or public exposure, change the published host IP deliberately and review [Security](./security.md) first.
 
 To pin a release tag or switch registries later, override `NULLCLAW_IMAGE`:
 

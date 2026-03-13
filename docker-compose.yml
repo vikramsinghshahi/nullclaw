@@ -17,7 +17,7 @@ services:
     profiles: ["gateway"]
     command: ["gateway", "--port", "3000", "--host", "::"]
     ports:
-      - "${NULLCLAW_GATEWAY_PORT:-3000}:3000"
+      - "127.0.0.1:${NULLCLAW_GATEWAY_PORT:-3000}:3000"
     env_file:
       - path: .env
         required: false
