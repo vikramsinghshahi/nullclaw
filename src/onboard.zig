@@ -966,7 +966,7 @@ pub fn memoryProfileForBackend(backend: []const u8) []const u8 {
 
 pub fn isWizardInteractiveChannel(channel_id: channel_catalog.ChannelId) bool {
     return switch (channel_id) {
-        .telegram, .discord, .slack, .webhook, .mattermost, .matrix, .signal, .nostr => true,
+        .telegram, .discord, .slack, .webhook, .mattermost, .matrix, .signal, .nostr, .max => true,
         else => false,
     };
 }
@@ -1082,6 +1082,7 @@ fn configureSingleChannel(
         .signal => configureSignalChannel(cfg, out, input_buf, prefix),
         .webhook => configureWebhookChannel(cfg, out, input_buf, prefix),
         .nostr => configureNostrChannel(cfg, out, input_buf, prefix),
+        .max => configureMaxChannel(cfg, out, input_buf, prefix),
         else => blk: {
             try out.print("{s}  {s}: interactive setup not implemented yet. Edit {s} manually.\n", .{ prefix, meta.label, cfg.config_path });
             break :blk false;
@@ -1442,6 +1443,100 @@ fn configureNostrChannel(cfg: *Config, out: *std.Io.Writer, input_buf: []u8, pre
     }
     try out.print("{s}  -> Default relays: relay.damus.io, nos.lol, relay.nostr.band, auth.nostr1.com, relay.primal.net\n", .{prefix});
     try out.print("{s}  -> Edit config to add: display_name, nip05, lnurl, dm_allowed_pubkeys\n\n", .{prefix});
+    return true;
+}
+
+fn configureMaxChannel(cfg: *Config, out: *std.Io.Writer, _: []u8, prefix: []const u8) !bool {
+    var account_id_buf: [128]u8 = undefined;
+    var token_buf: [512]u8 = undefined;
+    var allow_input_buf: [512]u8 = undefined;
+    var mode_buf: [64]u8 = undefined;
+    var webhook_url_buf: [512]u8 = undefined;
+    var webhook_secret_buf: [256]u8 = undefined;
+    var mention_buf: [32]u8 = undefined;
+
+    try out.print("{s}  Max account_id [default]: ", .{prefix});
+    const account_id_input = prompt(out, &account_id_buf, "", "default") orelse return false;
+    const account_id = if (account_id_input.len == 0) "default" else account_id_input;
+
+    try out.print("{s}  Max bot token (required, Enter to skip): ", .{prefix});
+    const token = prompt(out, &token_buf, "", "") orelse return false;
+    if (token.len == 0) {
+        try out.print("{s}  -> Max skipped\n", .{prefix});
+        return false;
+    }
+
+    try out.print("{s}  Max allow_from (user_id/username, comma-separated) [*]: ", .{prefix});
+    const allow_input = prompt(out, &allow_input_buf, "", "") orelse return false;
+
+    try out.print("{s}  Max receive mode [polling/webhook] (default: polling): ", .{prefix});
+    const mode_input = prompt(out, &mode_buf, "", "polling") orelse return false;
+    const webhook_mode = std.ascii.eqlIgnoreCase(mode_input, "webhook");
+
+    const webhook_url_input = if (webhook_mode) blk: {
+        try out.print("{s}  Max webhook URL (HTTPS, required for webhook mode): ", .{prefix});
+        const raw_url = prompt(out, &webhook_url_buf, "", "") orelse return false;
+        const trimmed_url = std.mem.trim(u8, raw_url, " \t\r\n");
+        if (trimmed_url.len == 0 or !std.mem.startsWith(u8, trimmed_url, "https://")) {
+            try out.print("{s}  -> Max skipped (webhook mode requires HTTPS webhook_url)\n", .{prefix});
+            return false;
+        }
+        break :blk trimmed_url;
+    } else null;
+
+    const webhook_secret_input = if (webhook_mode) blk: {
+        try out.print("{s}  Max webhook secret (optional, recommended): ", .{prefix});
+        const raw_secret = prompt(out, &webhook_secret_buf, "", "") orelse return false;
+        break :blk std.mem.trim(u8, raw_secret, " \t\r\n");
+    } else null;
+
+    try out.print("{s}  Require @mention in group chats? [y/N]: ", .{prefix});
+    const mention_input = prompt(out, &mention_buf, "", "n") orelse return false;
+    const require_mention = mention_input.len > 0 and (mention_input[0] == 'y' or mention_input[0] == 'Y');
+
+    const allow_from = try parseTelegramAllowFrom(cfg.allocator, allow_input);
+    errdefer {
+        for (allow_from) |entry| cfg.allocator.free(entry);
+        cfg.allocator.free(allow_from);
+    }
+
+    var webhook_url: ?[]const u8 = null;
+    errdefer if (webhook_url) |value| cfg.allocator.free(value);
+    var webhook_secret: ?[]const u8 = null;
+    errdefer if (webhook_secret) |value| cfg.allocator.free(value);
+
+    if (webhook_mode) {
+        webhook_url = try cfg.allocator.dupe(u8, webhook_url_input.?);
+        if (webhook_secret_input.?.len > 0) {
+            webhook_secret = try cfg.allocator.dupe(u8, webhook_secret_input.?);
+        }
+    }
+
+    const accounts = try cfg.allocator.alloc(config_mod.MaxConfig, 1);
+    accounts[0] = .{
+        .account_id = try cfg.allocator.dupe(u8, account_id),
+        .bot_token = try cfg.allocator.dupe(u8, token),
+        .allow_from = allow_from,
+        .group_policy = "allowlist",
+        .mode = if (webhook_mode) .webhook else .polling,
+        .webhook_url = webhook_url,
+        .webhook_secret = webhook_secret,
+        .require_mention = require_mention,
+        .streaming = true,
+    };
+    cfg.channels.max = accounts;
+
+    try out.print("{s}  -> Max configured (account_id={s}, mode={s}", .{
+        prefix,
+        account_id,
+        if (webhook_mode) "webhook" else "polling",
+    });
+    if (allow_from.len == 1 and std.mem.eql(u8, allow_from[0], "*")) {
+        try out.print(", allow_from=*", .{});
+    } else {
+        try out.print(", allow_from={d}", .{allow_from.len});
+    }
+    try out.print(")\n", .{});
     return true;
 }
 
@@ -2636,6 +2731,7 @@ test "isWizardInteractiveChannel includes supported onboarding channels" {
     try std.testing.expect(isWizardInteractiveChannel(.matrix));
     try std.testing.expect(isWizardInteractiveChannel(.signal));
     try std.testing.expect(isWizardInteractiveChannel(.nostr));
+    try std.testing.expect(isWizardInteractiveChannel(.max));
     try std.testing.expect(!isWizardInteractiveChannel(.whatsapp));
 }
 
@@ -3252,10 +3348,12 @@ test "findChannelOptionIndex supports number and key" {
     const options = [_]channel_catalog.ChannelMeta{
         .{ .id = .telegram, .key = "telegram", .label = "Telegram", .configured_message = "Telegram configured", .listener_mode = .polling },
         .{ .id = .discord, .key = "discord", .label = "Discord", .configured_message = "Discord configured", .listener_mode = .gateway_loop },
+        .{ .id = .max, .key = "max", .label = "Max", .configured_message = "Max configured", .listener_mode = .polling },
     };
 
     try std.testing.expectEqual(@as(?usize, 0), findChannelOptionIndex("1", &options));
     try std.testing.expectEqual(@as(?usize, 1), findChannelOptionIndex("discord", &options));
+    try std.testing.expectEqual(@as(?usize, 2), findChannelOptionIndex("max", &options));
     try std.testing.expect(findChannelOptionIndex("unknown", &options) == null);
 }
 
