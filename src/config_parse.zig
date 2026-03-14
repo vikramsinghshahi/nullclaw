@@ -630,11 +630,17 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                 const server_name = entry.key_ptr.*;
                 const val = entry.value_ptr.*;
                 if (val != .object) continue;
+                // `transport` is optional. If omitted, infer it from the presence of `url`.
+                // This keeps the config compatible with MCP READMEs that only specify
+                // {command,args} (stdio) or {url,headers} (http).
                 const transport_val = val.object.get("transport");
                 const transport = if (transport_val) |tv| blk: {
                     if (tv != .string) continue;
                     break :blk tv.string;
-                } else types.McpServerConfig.DEFAULT_TRANSPORT;
+                } else if (val.object.get("url") != null)
+                    types.McpServerConfig.HTTP_TRANSPORT
+                else
+                    types.McpServerConfig.DEFAULT_TRANSPORT;
                 const is_http = types.McpServerConfig.isHttpTransport(transport);
 
                 var command: []const u8 = "";

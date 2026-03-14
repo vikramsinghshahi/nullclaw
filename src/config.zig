@@ -3486,6 +3486,49 @@ test "json parse mcp_servers http transport" {
     allocator.free(cfg.mcp_servers);
 }
 
+test "json parse mcp_servers infers http transport from url" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"mcp_servers": {
+        \\  "remote": {
+        \\    "url": "https://mcp.example.com/rpc",
+        \\    "timeout_ms": 2500,
+        \\    "headers": {"Authorization": "Bearer test-token"}
+        \\  }
+        \\}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expectEqual(@as(usize, 1), cfg.mcp_servers.len);
+    const s = cfg.mcp_servers[0];
+    try std.testing.expectEqualStrings("remote", s.name);
+    try std.testing.expectEqualStrings("http", s.transport);
+    try std.testing.expectEqualStrings("", s.command);
+    try std.testing.expectEqualStrings("https://mcp.example.com/rpc", s.url.?);
+    try std.testing.expectEqual(@as(u32, 2500), s.timeout_ms);
+    try std.testing.expectEqual(@as(usize, 1), s.headers.len);
+    try std.testing.expectEqualStrings("Authorization", s.headers[0].key);
+    try std.testing.expectEqualStrings("Bearer test-token", s.headers[0].value);
+
+    allocator.free(s.name);
+    allocator.free(s.transport);
+    allocator.free(s.command);
+    if (s.url) |u| allocator.free(u);
+    for (s.args) |a| allocator.free(a);
+    allocator.free(s.args);
+    for (s.env) |e| {
+        allocator.free(e.key);
+        allocator.free(e.value);
+    }
+    allocator.free(s.env);
+    for (s.headers) |h| {
+        allocator.free(h.key);
+        allocator.free(h.value);
+    }
+    allocator.free(s.headers);
+    allocator.free(cfg.mcp_servers);
+}
+
 test "json parse providers section" {
     const allocator = std.testing.allocator;
     const json =

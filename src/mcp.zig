@@ -10,6 +10,7 @@ const json_util = @import("json_util.zig");
 const version = @import("version.zig");
 const platform = @import("platform.zig");
 const http_util = @import("http_util.zig");
+const verbose = @import("verbose.zig");
 const Allocator = std.mem.Allocator;
 
 const log = std.log.scoped(.mcp);
@@ -33,6 +34,7 @@ pub const McpServer = struct {
     child: ?std.process.Child,
     http_client: ?std.http.Client,
     next_id: u32,
+    mcp_session_id: ?[]u8,
 
     pub fn init(allocator: Allocator, config: McpServerConfig) McpServer {
         return .{
@@ -42,6 +44,7 @@ pub const McpServer = struct {
             .child = null,
             .http_client = null,
             .next_id = 1,
+            .mcp_session_id = null,
         };
     }
 
@@ -155,6 +158,10 @@ pub const McpServer = struct {
             client.deinit();
             self.http_client = null;
         }
+        if (self.mcp_session_id) |sid| {
+            self.allocator.free(sid);
+            self.mcp_session_id = null;
+        }
         if (self.child) |*child| {
             // Close stdin to signal the server to exit
             if (child.stdin) |stdin| {
@@ -182,9 +189,21 @@ pub const McpServer = struct {
                 \\{{"jsonrpc":"2.0","id":{d},"method":"{s}"}}
             ++ "\n", .{ id, method });
         defer allocator.free(msg);
-
         if (McpServerConfig.isHttpTransport(self.config.transport)) {
-            return self.sendHttpRequest(allocator, msg);
+            const resp = try self.sendHttpRequest(allocator, msg);
+            defer allocator.free(resp.headers);
+            if (resp.status_code < 200 or resp.status_code >= 300) {
+                const max_body: usize = 4096;
+                const body_truncated = if (resp.body.len > max_body) resp.body[0..max_body] else resp.body;
+                if (verbose.isVerbose()) {
+                    log.err("MCP server '{s}': HTTP {d}: {s}", .{ self.name, resp.status_code, body_truncated });
+                } else {
+                    log.err("MCP server '{s}': HTTP {d}", .{ self.name, resp.status_code });
+                }
+                allocator.free(resp.body);
+                return error.HttpBadStatus;
+            }
+            return resp.body;
         }
 
         const stdin = self.child.?.stdin orelse return error.NoStdin;
@@ -203,10 +222,10 @@ pub const McpServer = struct {
                 \\{{"jsonrpc":"2.0","method":"{s}"}}
             ++ "\n", .{method});
         defer self.allocator.free(msg);
-
         if (McpServerConfig.isHttpTransport(self.config.transport)) {
-            const resp = try self.sendHttpRequest(self.allocator, msg);
-            self.allocator.free(resp);
+            const resp = self.sendHttpRequest(self.allocator, msg) catch return;
+            self.allocator.free(resp.headers);
+            self.allocator.free(resp.body);
             return;
         }
 
@@ -214,7 +233,22 @@ pub const McpServer = struct {
         try stdin.writeAll(msg);
     }
 
-    fn sendHttpRequest(self: *McpServer, allocator: Allocator, msg: []const u8) ![]const u8 {
+    fn extractMcpSessionIdFromHeaders(headers: []const u8) ?[]const u8 {
+        var it = std.mem.splitScalar(u8, headers, '\n');
+        while (it.next()) |line_raw| {
+            const line = std.mem.trim(u8, line_raw, " \t\r\n");
+            if (line.len == 0) continue;
+            const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+            const name = std.mem.trim(u8, line[0..colon], " \t");
+            if (!std.ascii.eqlIgnoreCase(name, "mcp-session-id")) continue;
+            const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
+            if (value.len == 0) return null;
+            return value;
+        }
+        return null;
+    }
+
+    fn sendHttpRequest(self: *McpServer, allocator: Allocator, msg: []const u8) !http_util.HttpResponseWithHeaders {
         if (self.http_client == null) return error.NoHttpClient;
         const url = self.config.url orelse return error.MissingHttpUrl;
 
@@ -223,6 +257,12 @@ pub const McpServer = struct {
 
         headers_buf[header_count] = .{ .name = "Content-Type", .value = "application/json" };
         header_count += 1;
+
+        if (self.mcp_session_id) |sid| {
+            if (header_count >= headers_buf.len) return error.TooManyHeaders;
+            headers_buf[header_count] = .{ .name = "mcp-session-id", .value = sid };
+            header_count += 1;
+        }
 
         for (self.config.headers) |entry| {
             if (header_count >= headers_buf.len) return error.TooManyHeaders;
@@ -246,8 +286,7 @@ pub const McpServer = struct {
         for (headers_buf[0..header_count]) |h| {
             try header_lines.append(allocator, try std.fmt.allocPrint(allocator, "{s}: {s}", .{ h.name, h.value }));
         }
-
-        const resp = http_util.curlPostWithStatusAndTimeout(
+        const resp = http_util.curlPostWithStatusHeadersAndTimeout(
             allocator,
             url,
             msg,
@@ -258,22 +297,17 @@ pub const McpServer = struct {
             error.CurlFailed, error.CurlReadError, error.CurlWriteError, error.CurlWaitError, error.CurlParseError => return error.HttpRequestFailed,
             else => return err,
         };
-        errdefer allocator.free(resp.body);
-
-        const status_code = resp.status_code;
-        if (status_code < 200 or status_code >= 300) {
-            // Preserve HTTP status in the surfaced error so users can
-            // distinguish auth/404/500 from a generic parse error.
-            //
-            // Tool result formatting will scrub secrets as needed.
-            const max_body: usize = 4096;
-            const body_truncated = if (resp.body.len > max_body) resp.body[0..max_body] else resp.body;
-            const out = try std.fmt.allocPrint(allocator, "HTTP {d}: {s}", .{ status_code, body_truncated });
+        errdefer {
+            allocator.free(resp.headers);
             allocator.free(resp.body);
-            return out;
+        }
+        if (extractMcpSessionIdFromHeaders(resp.headers)) |sid| {
+            const owned = try self.allocator.dupe(u8, sid);
+            if (self.mcp_session_id) |old| self.allocator.free(old);
+            self.mcp_session_id = owned;
         }
 
-        return resp.body;
+        return resp;
     }
 
     fn readLine(self: *McpServer, allocator: Allocator) ![]const u8 {
@@ -711,4 +745,16 @@ test "buildJsonRpcRequest format" {
     try std.testing.expectEqualStrings("2.0", jsonrpc.string);
     const id_val = parsed.value.object.get("id").?;
     try std.testing.expectEqual(@as(i64, 42), id_val.integer);
+}
+
+test "extractMcpSessionIdFromHeaders parses CRLF headers" {
+    const hdr = "HTTP/2 200\r\ncontent-type: application/json\r\nmcp-session-id: abc123\r\ncache-control: no-cache\r\n";
+    const got = McpServer.extractMcpSessionIdFromHeaders(hdr) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("abc123", got);
+}
+
+test "extractMcpSessionIdFromHeaders parses LF headers" {
+    const hdr = "HTTP/1.1 200 OK\nMCP-Session-Id: zzz\nX: y\n";
+    const got = McpServer.extractMcpSessionIdFromHeaders(hdr) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("zzz", got);
 }
