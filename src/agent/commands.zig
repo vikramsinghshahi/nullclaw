@@ -2465,6 +2465,14 @@ fn handleConfigCommand(self: anytype, arg: []const u8) ![]const u8 {
     }
 
     if (std.ascii.eqlIgnoreCase(action, "reload") or std.ascii.eqlIgnoreCase(action, "refresh")) {
+        if (std.mem.trim(u8, parsed.tail, " \t").len > 0) {
+            return try self.allocator.dupe(u8, "Usage: /config reload");
+        }
+
+        config_mutator.validateCurrentConfig(self.allocator) catch |err| {
+            return try std.fmt.allocPrint(self.allocator, "Config reload failed: validation error ({s})", .{@errorName(err)});
+        };
+
         const hot_reload_paths = [_][]const u8{
             "agents.defaults.model.primary",
             "default_temperature",
@@ -2476,6 +2484,7 @@ fn handleConfigCommand(self: anytype, arg: []const u8) ![]const u8 {
 
         var attempted: usize = 0;
         var applied: usize = 0;
+        var skipped: usize = 0;
         var failed: usize = 0;
 
         for (hot_reload_paths) |path| {
@@ -2485,12 +2494,21 @@ fn handleConfigCommand(self: anytype, arg: []const u8) ![]const u8 {
             };
             defer self.allocator.free(value_json);
 
+            if (std.mem.eql(u8, std.mem.trim(u8, value_json, " \t\r\n"), "null")) {
+                skipped += 1;
+                continue;
+            }
+
             attempted += 1;
             const hot_applied = hotApplyConfigChange(self, .set, path, value_json) catch {
                 failed += 1;
                 continue;
             };
-            if (hot_applied) applied += 1;
+            if (hot_applied) {
+                applied += 1;
+            } else {
+                skipped += 1;
+            }
         }
 
         if (applied > 0) {
@@ -2499,8 +2517,8 @@ fn handleConfigCommand(self: anytype, arg: []const u8) ![]const u8 {
 
         return try std.fmt.allocPrint(
             self.allocator,
-            "Config hot reload complete: attempted={d} applied={d} failed={d}",
-            .{ attempted, applied, failed },
+            "Config hot reload complete: attempted={d} applied={d} skipped={d} failed={d}",
+            .{ attempted, applied, skipped, failed },
         );
     }
 
@@ -2604,6 +2622,9 @@ fn handleSkillCommand(self: anytype, arg: []const u8) ![]const u8 {
     const action_or_name = parsed.head;
 
     if (std.ascii.eqlIgnoreCase(action_or_name, "reload") or std.ascii.eqlIgnoreCase(action_or_name, "refresh")) {
+        if (std.mem.trim(u8, parsed.tail, " \t").len > 0) {
+            return try self.allocator.dupe(u8, "Usage: /skill reload");
+        }
         invalidateSystemPromptCache(self);
         return try self.allocator.dupe(u8, "Skills reloaded for this session. Updated skill instructions will apply on the next turn.");
     }
