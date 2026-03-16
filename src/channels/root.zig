@@ -16,6 +16,9 @@
 //!   - DingTalk (WebSocket stream mode)
 
 const std = @import("std");
+const streaming = @import("../streaming.zig");
+pub const outbound = @import("../outbound.zig");
+pub const OutboundPayload = outbound.Payload;
 
 // ════════════════════════════════════════════════════════════════════════════
 // Shared Types
@@ -59,6 +62,8 @@ pub const Channel = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
 
+    pub const OutboundStage = streaming.OutboundStage;
+
     fn defaultStartTyping(_: *anyopaque, _: []const u8) anyerror!void {}
     fn defaultStopTyping(_: *anyopaque, _: []const u8) anyerror!void {}
 
@@ -73,6 +78,18 @@ pub const Channel = struct {
         name: *const fn (ptr: *anyopaque) []const u8,
         /// Health check — return true if the channel is operational.
         healthCheck: *const fn (ptr: *anyopaque) bool,
+        /// Optional staged outbound event delivery (chunk/final).
+        /// If null, runtime falls back to send() for `.final` and ignores `.chunk`.
+        sendEvent: ?*const fn (
+            ptr: *anyopaque,
+            target: []const u8,
+            message: []const u8,
+            media: []const []const u8,
+            stage: OutboundStage,
+        ) anyerror!void = null,
+        /// Optional rich-message delivery (cards, buttons, sections).
+        /// If null, Channel.sendRich() falls back to Payload.toPlainText() + send().
+        sendRich: ?*const fn (ptr: *anyopaque, target: []const u8, payload: OutboundPayload) anyerror!void = null,
         /// Start processing indicator for a recipient (e.g., typing status).
         startTyping: *const fn (ptr: *anyopaque, recipient: []const u8) anyerror!void = &defaultStartTyping,
         /// Stop processing indicator for a recipient.
@@ -91,6 +108,13 @@ pub const Channel = struct {
         return self.vtable.send(self.ptr, target, message, media);
     }
 
+    pub fn sendEvent(self: Channel, target: []const u8, message: []const u8, media: []const []const u8, stage: OutboundStage) !void {
+        if (self.vtable.sendEvent) |fn_send_event| {
+            return fn_send_event(self.ptr, target, message, media, stage);
+        }
+        if (stage == .final) return self.send(target, message, media);
+    }
+
     pub fn name(self: Channel) []const u8 {
         return self.vtable.name(self.ptr);
     }
@@ -105,6 +129,17 @@ pub const Channel = struct {
 
     pub fn stopTyping(self: Channel, recipient: []const u8) !void {
         return self.vtable.stopTyping(self.ptr, recipient);
+    }
+
+    /// Send a rich card payload. If the channel implements sendRich, delegates to it.
+    /// Otherwise renders the payload to plain text and calls send().
+    pub fn sendRich(self: Channel, allocator: std.mem.Allocator, target: []const u8, payload: OutboundPayload) !void {
+        if (self.vtable.sendRich) |fn_rich| {
+            return fn_rich(self.ptr, target, payload);
+        }
+        const text = try payload.toPlainText(allocator);
+        defer allocator.free(text);
+        return self.send(target, text, &.{});
     }
 };
 
@@ -124,11 +159,26 @@ pub const imessage = @import("imessage.zig");
 pub const email = @import("email.zig");
 pub const lark = @import("lark.zig");
 pub const dingtalk = @import("dingtalk.zig");
+pub const nostr = @import("nostr.zig");
 pub const line = @import("line.zig");
 pub const onebot = @import("onebot.zig");
 pub const qq = @import("qq.zig");
 pub const maixcam = @import("maixcam.zig");
 pub const signal = @import("signal.zig");
+pub const web = if (@import("build_options").enable_channel_web)
+    @import("web.zig")
+else
+    struct {
+        pub const WebChannel = struct {
+            pub fn initFromConfig(_: @import("std").mem.Allocator, _: anytype) @This() {
+                return .{};
+            }
+            pub fn channel(_: *@This()) Channel {
+                unreachable;
+            }
+            pub fn setBus(_: *@This(), _: anytype) void {}
+        };
+    };
 pub const dispatch = @import("dispatch.zig");
 
 // ════════════════════════════════════════════════════════════════════════════
