@@ -787,7 +787,7 @@ test "fromConfig applies native_tools override for ollama" {
 
 test "fromConfig passes api_key through to ollama" {
     const alloc = std.testing.allocator;
-    var h = ProviderHolder.fromConfig(alloc, "ollama", "ollama-key", "https://api.ollama.example", true, null);
+    var h = ProviderHolder.fromConfig(alloc, "ollama", "ollama-key", "https://api.ollama.example", true, null, null);
     defer h.deinit();
     try std.testing.expect(h == .ollama);
     try std.testing.expectEqualStrings("ollama-key", h.ollama.api_key.?);
