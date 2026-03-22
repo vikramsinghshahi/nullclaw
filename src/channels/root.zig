@@ -277,7 +277,6 @@ pub const telegram = @import("telegram.zig");
 pub const discord = @import("discord.zig");
 pub const slack = @import("slack.zig");
 pub const whatsapp = @import("whatsapp.zig");
-<<<<<<< HEAD
 pub const whatsapp_web = if (@import("build_options").enable_channel_whatsapp_web)
     @import("whatsapp_web.zig")
 else
@@ -292,9 +291,7 @@ else
             pub fn setBus(_: *@This(), _: anytype) void {}
         };
     };
-=======
 pub const teams = @import("teams.zig");
->>>>>>> main
 pub const matrix = @import("matrix.zig");
 pub const mattermost = @import("mattermost.zig");
 pub const irc = @import("irc.zig");

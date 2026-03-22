@@ -337,11 +337,11 @@ pub const inbound_route_descriptors = [_]InboundRouteDescriptor{
         .derive_peer = deriveWebPeer,
     },
     .{
-<<<<<<< HEAD
         .channel_name = "whatsapp_web",
         .default_account_id = defaultWhatsAppWebAccount,
         .derive_peer = deriveWhatsAppWebPeer,
-=======
+    },
+    .{
         .channel_name = "max",
         .default_account_id = defaultMaxAccount,
         .derive_peer = deriveMaxPeer,
@@ -350,7 +350,6 @@ pub const inbound_route_descriptors = [_]InboundRouteDescriptor{
         .channel_name = "nostr",
         .default_account_id = defaultNostrAccount,
         .derive_peer = deriveNostrPeer,
->>>>>>> main
     },
 };
 

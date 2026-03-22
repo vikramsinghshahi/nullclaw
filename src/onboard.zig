@@ -1169,11 +1169,7 @@ pub fn memoryProfileForBackend(backend: []const u8) []const u8 {
 
 pub fn isWizardInteractiveChannel(channel_id: channel_catalog.ChannelId) bool {
     return switch (channel_id) {
-<<<<<<< HEAD
-        .telegram, .discord, .slack, .webhook, .mattermost, .matrix, .signal, .nostr, .whatsapp_web => true,
-=======
-        .telegram, .discord, .slack, .webhook, .mattermost, .matrix, .signal, .external, .nostr, .max => true,
->>>>>>> main
+        .telegram, .discord, .slack, .webhook, .mattermost, .matrix, .signal, .nostr, .whatsapp_web, .external, .max => true,
         else => false,
     };
 }
@@ -3186,11 +3182,8 @@ test "isWizardInteractiveChannel includes supported onboarding channels" {
     try std.testing.expect(isWizardInteractiveChannel(.signal));
     try std.testing.expect(isWizardInteractiveChannel(.external));
     try std.testing.expect(isWizardInteractiveChannel(.nostr));
-<<<<<<< HEAD
     try std.testing.expect(isWizardInteractiveChannel(.whatsapp_web));
-=======
     try std.testing.expect(isWizardInteractiveChannel(.max));
->>>>>>> main
     try std.testing.expect(!isWizardInteractiveChannel(.whatsapp));
 }
 

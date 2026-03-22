@@ -1117,20 +1117,18 @@ test "ChannelManager collectConfiguredChannels wires listener types accounts and
         try std.testing.expectEqualStrings("slack-admin", slack_ptr.policy.allowlist[0]);
     }
 
-<<<<<<< HEAD
     if (comptime channel_catalog.isBuildEnabledByKey("whatsapp_web")) {
         const wa_web_entry = findEntryByNameAccount(entries, "whatsapp_web", "wa-web-main") orelse
             return error.TestUnexpectedResult;
         const wa_web_ptr: *whatsapp_web.WhatsAppWebChannel = @ptrCast(@alignCast(wa_web_entry.channel.ptr));
         try std.testing.expect(wa_web_ptr.event_bus == &event_bus);
-=======
+    }
     if (channel_catalog.isBuildEnabled(.dingtalk)) {
         const dingtalk_entry = findEntryByNameAccount(entries, "dingtalk", "ding-main") orelse
             return error.TestUnexpectedResult;
         const dingtalk_ptr: *dingtalk.DingTalkChannel = @ptrCast(@alignCast(dingtalk_entry.channel.ptr));
         try std.testing.expectEqual(ListenerType.gateway_loop, dingtalk_entry.listener_type);
         try std.testing.expect(dingtalk_ptr.event_bus == &event_bus);
->>>>>>> main
     }
 }
 

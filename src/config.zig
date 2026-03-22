@@ -58,11 +58,8 @@ pub const MatrixConfig = config_types.MatrixConfig;
 pub const MaxConfig = config_types.MaxConfig;
 pub const MattermostConfig = config_types.MattermostConfig;
 pub const WhatsAppConfig = config_types.WhatsAppConfig;
-<<<<<<< HEAD
 pub const WhatsAppWebConfig = config_types.WhatsAppWebConfig;
-=======
 pub const ExternalChannelConfig = config_types.ExternalChannelConfig;
->>>>>>> main
 pub const IrcConfig = config_types.IrcConfig;
 pub const LarkReceiveMode = config_types.LarkReceiveMode;
 pub const LarkConfig = config_types.LarkConfig;

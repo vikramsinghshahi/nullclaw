@@ -904,11 +904,8 @@ pub const ChannelsConfig = struct {
     matrix: []const MatrixConfig = &.{},
     mattermost: []const MattermostConfig = &.{},
     whatsapp: []const WhatsAppConfig = &.{},
-<<<<<<< HEAD
     whatsapp_web: []const WhatsAppWebConfig = &.{},
-=======
     teams: []const TeamsConfig = &.{},
->>>>>>> main
     irc: []const IrcConfig = &.{},
     lark: []const LarkConfig = &.{},
     dingtalk: []const DingTalkConfig = &.{},
@@ -964,13 +961,11 @@ pub const ChannelsConfig = struct {
     pub fn whatsappPrimary(self: *const ChannelsConfig) ?WhatsAppConfig {
         return primaryAccount(WhatsAppConfig, self.whatsapp);
     }
-<<<<<<< HEAD
     pub fn whatsappWebPrimary(self: *const ChannelsConfig) ?WhatsAppWebConfig {
         return primaryAccount(WhatsAppWebConfig, self.whatsapp_web);
-=======
+    }
     pub fn teamsPrimary(self: *const ChannelsConfig) ?TeamsConfig {
         return primaryAccount(TeamsConfig, self.teams);
->>>>>>> main
     }
     pub fn ircPrimary(self: *const ChannelsConfig) ?IrcConfig {
         return primaryAccount(IrcConfig, self.irc);
