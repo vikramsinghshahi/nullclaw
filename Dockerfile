@@ -37,6 +37,13 @@ FROM busybox:1.37 AS config
 
 RUN mkdir -p /nullclaw-data/.nullclaw /nullclaw-data/workspace
 
+# Copy workspace templates into the image so the agent can read them at runtime
+COPY src/workspace_templates/USER.md /nullclaw-data/workspace/USER.md
+COPY src/workspace_templates/IDENTITY.md /nullclaw-data/workspace/IDENTITY.md
+COPY src/workspace_templates/TOOLS.md /nullclaw-data/workspace/TOOLS.md
+COPY src/workspace_templates/SOUL.md /nullclaw-data/workspace/SOUL.md
+COPY src/workspace_templates/AGENTS.md /nullclaw-data/workspace/AGENTS.md
+
 RUN cat > /nullclaw-data/.nullclaw/config.json << 'EOF'
 {
   "default_temperature": 0.7,
@@ -50,11 +57,12 @@ RUN cat > /nullclaw-data/.nullclaw/config.json << 'EOF'
       "model": {
         "primary": "openrouter/deepseek/deepseek-chat",
         "fallback": "openrouter/openai/gpt-4o-mini"
-      }
+      },
+      "system_prompt": "You are a capable coding assistant with full git access. You can use the git_operations tool for: status, diff, log, branch, commit, add, checkout, stash, and push. For git init, remote add, or clone, use the shell tool. The workspace directory is /nullclaw-data/workspace. When asked to push code, first ensure credentials are configured (use git_operations with operation 'configure_credentials' or check GITHUB_TOKEN env var), then use git_operations with operation 'push'."
     }
   },
   "agent": {
-    "max_tool_iterations": 3
+    "max_tool_iterations": 5
   },
   "channels": {
     "cli": true,
@@ -75,7 +83,7 @@ RUN cat > /nullclaw-data/.nullclaw/config.json << 'EOF'
   "autonomy": {
     "level": "full",
     "workspace_only": true,
-    "allowed_commands": ["git", "git *", "ls", "cat", "echo", "pwd", "mkdir", "mv", "cp","bash","sh","curl","wget","ssh","scp","sftp","ftp","telnet","nc","ncat","netcat","telnet","ssh","scp","sftp","ftp","telnet","nc","ncat","netcat"],
+    "allowed_commands": ["git", "git *", "ls", "cat", "echo", "pwd", "mkdir", "mv", "cp", "bash", "sh", "touch", "rm", "trash", "find", "grep", "head", "tail", "wc"],
     "allowed_paths": ["/nullclaw-data/workspace"]
   },
   "gateway": {
