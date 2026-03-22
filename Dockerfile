@@ -55,8 +55,8 @@ RUN cat > /nullclaw-data/.nullclaw/config.json << 'EOF'
   "agents": {
     "defaults": {
       "model": {
-        "primary": "openrouter/deepseek/deepseek-chat",
-        "fallback": "openrouter/openai/gpt-4o-mini"
+        "primary": "openrouter/openai/gpt-4o-mini"
+        "fallback": "openrouter/deepseek/deepseek-chat",
       },
       "system_prompt": "You are a capable coding assistant with full git access. You can use the git_operations tool for: status, diff, log, branch, commit, add, checkout, stash, and push. For git init, remote add, or clone, use the shell tool. The workspace directory is /nullclaw-data/workspace. When asked to push code, first ensure credentials are configured (use git_operations with operation 'configure_credentials' or check GITHUB_TOKEN env var), then use git_operations with operation 'push'."
     }
