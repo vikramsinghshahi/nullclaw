@@ -12,54 +12,182 @@ const capabilities_mod = @import("../capabilities.zig");
 const config_mutator = @import("../config_mutator.zig");
 const context_tokens = @import("context_tokens.zig");
 const max_tokens_resolver = @import("max_tokens.zig");
+const control_plane = @import("../control_plane.zig");
+const provider_names = @import("../provider_names.zig");
 const version = @import("../version.zig");
+const command_summary = @import("../command_summary.zig");
+const log = std.log.scoped(.agent);
 
-const SlashCommand = struct {
-    name: []const u8,
-    arg: []const u8,
-};
+const SlashCommand = control_plane.SlashCommand;
+const parseSlashCommand = control_plane.parseSlashCommand;
+const isSlashName = control_plane.isSlashName;
 
 pub const BARE_SESSION_RESET_PROMPT =
     "A new session was started via /new or /reset. Execute your Session Startup sequence now - read the required files before responding to the user. Then greet the user in your configured persona, if one is provided. Be yourself - use your defined voice, mannerisms, and mood. Keep it to 1-3 sentences and ask what they want to do. If the runtime model differs from default_model in the system prompt, mention the default model. Do not mention internal steps, files, tools, or reasoning.";
-
-fn parseSlashCommand(message: []const u8) ?SlashCommand {
-    const trimmed = std.mem.trim(u8, message, " \t\r\n");
-    if (trimmed.len <= 1 or trimmed[0] != '/') return null;
-
-    const body = trimmed[1..];
-    var split_idx: usize = 0;
-    while (split_idx < body.len) : (split_idx += 1) {
-        const ch = body[split_idx];
-        if (ch == ':' or ch == ' ' or ch == '\t') break;
-    }
-    if (split_idx == 0) return null;
-
-    const raw_name = body[0..split_idx];
-    const name = if (std.mem.indexOfScalar(u8, raw_name, '@')) |mention_sep|
-        raw_name[0..mention_sep]
-    else
-        raw_name;
-    if (name.len == 0) return null;
-    var rest = body[split_idx..];
-    if (rest.len > 0 and rest[0] == ':') {
-        rest = rest[1..];
-    }
-
-    return .{
-        .name = name,
-        .arg = std.mem.trim(u8, rest, " \t"),
-    };
-}
-
-fn isSlashName(cmd: SlashCommand, expected: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(cmd.name, expected);
-}
 
 pub fn bareSessionResetPrompt(message: []const u8) ?[]const u8 {
     const cmd = parseSlashCommand(message) orelse return null;
     if (!(isSlashName(cmd, "new") or isSlashName(cmd, "reset"))) return null;
     if (cmd.arg.len != 0) return null;
     return BARE_SESSION_RESET_PROMPT;
+}
+
+pub const TurnInputPlan = struct {
+    clear_session: bool = false,
+    invoke_local_handler: bool = false,
+    llm_user_message: ?[]const u8 = null,
+};
+
+const SlashCommandKind = enum {
+    new_reset,
+    restart,
+    help,
+    status,
+    whoami,
+    model,
+    think,
+    verbose,
+    reasoning,
+    exec,
+    queue,
+    usage,
+    tts,
+    stop,
+    compact,
+    allowlist,
+    approve,
+    context,
+    export_session,
+    session,
+    subagents,
+    agents,
+    focus,
+    unfocus,
+    kill,
+    steer,
+    tell,
+    config,
+    capabilities,
+    debug,
+    dock_telegram,
+    dock_discord,
+    dock_slack,
+    activation,
+    send,
+    elevated,
+    bash,
+    poll,
+    skill,
+    doctor,
+    memory,
+    unknown,
+};
+
+fn classifySlashCommand(cmd: SlashCommand) SlashCommandKind {
+    if (isSlashName(cmd, "new") or isSlashName(cmd, "reset")) return .new_reset;
+    if (isSlashName(cmd, "restart")) return .restart;
+    if (isSlashName(cmd, "help") or isSlashName(cmd, "commands") or isSlashName(cmd, "menu")) return .help;
+    if (isSlashName(cmd, "status")) return .status;
+    if (isSlashName(cmd, "whoami") or isSlashName(cmd, "id")) return .whoami;
+    if (isSlashName(cmd, "model") or isSlashName(cmd, "models")) return .model;
+    if (isSlashName(cmd, "think") or isSlashName(cmd, "thinking") or isSlashName(cmd, "t")) return .think;
+    if (isSlashName(cmd, "verbose") or isSlashName(cmd, "v")) return .verbose;
+    if (isSlashName(cmd, "reasoning") or isSlashName(cmd, "reason")) return .reasoning;
+    if (isSlashName(cmd, "exec")) return .exec;
+    if (isSlashName(cmd, "queue")) return .queue;
+    if (isSlashName(cmd, "usage")) return .usage;
+    if (isSlashName(cmd, "tts") or isSlashName(cmd, "voice")) return .tts;
+    if (isSlashName(cmd, "stop") or isSlashName(cmd, "abort")) return .stop;
+    if (isSlashName(cmd, "compact")) return .compact;
+    if (isSlashName(cmd, "allowlist")) return .allowlist;
+    if (isSlashName(cmd, "approve")) return .approve;
+    if (isSlashName(cmd, "context")) return .context;
+    if (isSlashName(cmd, "export-session") or isSlashName(cmd, "export")) return .export_session;
+    if (isSlashName(cmd, "session")) return .session;
+    if (isSlashName(cmd, "subagents") or isSlashName(cmd, "tasks")) return .subagents;
+    if (isSlashName(cmd, "agents")) return .agents;
+    if (isSlashName(cmd, "focus")) return .focus;
+    if (isSlashName(cmd, "unfocus")) return .unfocus;
+    if (isSlashName(cmd, "kill")) return .kill;
+    if (isSlashName(cmd, "steer")) return .steer;
+    if (isSlashName(cmd, "tell")) return .tell;
+    if (isSlashName(cmd, "config")) return .config;
+    if (isSlashName(cmd, "capabilities")) return .capabilities;
+    if (isSlashName(cmd, "debug")) return .debug;
+    if (isSlashName(cmd, "dock-telegram") or isSlashName(cmd, "dock_telegram")) return .dock_telegram;
+    if (isSlashName(cmd, "dock-discord") or isSlashName(cmd, "dock_discord")) return .dock_discord;
+    if (isSlashName(cmd, "dock-slack") or isSlashName(cmd, "dock_slack")) return .dock_slack;
+    if (isSlashName(cmd, "activation")) return .activation;
+    if (isSlashName(cmd, "send")) return .send;
+    if (isSlashName(cmd, "elevated") or isSlashName(cmd, "elev")) return .elevated;
+    if (isSlashName(cmd, "bash")) return .bash;
+    if (isSlashName(cmd, "poll")) return .poll;
+    if (isSlashName(cmd, "skill")) return .skill;
+    if (isSlashName(cmd, "doctor")) return .doctor;
+    if (isSlashName(cmd, "memory")) return .memory;
+    return .unknown;
+}
+
+fn slashCommandClearsSession(kind: SlashCommandKind) bool {
+    return kind == .new_reset or kind == .restart;
+}
+
+pub fn planTurnInput(message: []const u8) TurnInputPlan {
+    const cmd = parseSlashCommand(message) orelse return .{ .llm_user_message = message };
+    const kind = classifySlashCommand(cmd);
+    const clear_session = slashCommandClearsSession(kind);
+
+    if (bareSessionResetPrompt(message)) |fresh_prompt| {
+        return .{
+            .clear_session = clear_session,
+            .invoke_local_handler = true,
+            .llm_user_message = fresh_prompt,
+        };
+    }
+
+    if (kind != .unknown) {
+        return .{
+            .clear_session = clear_session,
+            .invoke_local_handler = true,
+            .llm_user_message = null,
+        };
+    }
+
+    return .{ .llm_user_message = message };
+}
+
+pub fn persistedRuntimeCommand(message: []const u8) ?[]const u8 {
+    const cmd = parseSlashCommand(message) orelse return null;
+    const kind = classifySlashCommand(cmd);
+    const arg = std.mem.trim(u8, cmd.arg, " \t");
+    const first = firstToken(arg);
+
+    return switch (kind) {
+        .think, .verbose, .reasoning, .usage, .activation, .send, .elevated => blk: {
+            if (first.len == 0 or std.ascii.eqlIgnoreCase(first, "status")) break :blk null;
+            break :blk message;
+        },
+        .exec, .tts => blk: {
+            if (arg.len == 0 or std.ascii.eqlIgnoreCase(arg, "status")) break :blk null;
+            break :blk message;
+        },
+        .queue => blk: {
+            if (arg.len == 0 or std.ascii.eqlIgnoreCase(arg, "status")) break :blk null;
+            break :blk message;
+        },
+        .session => blk: {
+            if (!std.ascii.eqlIgnoreCase(first, "ttl")) break :blk null;
+            const tail = splitFirstToken(arg).tail;
+            if (firstToken(tail).len == 0) break :blk null;
+            break :blk message;
+        },
+        .focus, .unfocus, .dock_telegram, .dock_discord, .dock_slack => message,
+        .debug => blk: {
+            if (std.ascii.eqlIgnoreCase(arg, "reset")) break :blk message;
+            break :blk null;
+        },
+        else => null,
+    };
 }
 
 fn firstToken(arg: []const u8) []const u8 {
@@ -119,10 +247,41 @@ fn setDefaultProvider(self: anytype, provider_name: []const u8) !void {
     self.default_provider = owned_provider;
 }
 
+fn setProfileSystemPrompt(self: anytype, prompt: ?[]const u8) !void {
+    if (!@hasField(@TypeOf(self.*), "profile_system_prompt")) return;
+
+    const owned_prompt = if (prompt) |value|
+        try self.allocator.dupe(u8, value)
+    else
+        null;
+
+    if (@hasField(@TypeOf(self.*), "profile_system_prompt_owned")) {
+        if (self.profile_system_prompt_owned and self.profile_system_prompt != null) {
+            self.allocator.free(self.profile_system_prompt.?);
+        }
+        self.profile_system_prompt_owned = false;
+    }
+
+    self.profile_system_prompt = owned_prompt;
+    if (@hasField(@TypeOf(self.*), "profile_system_prompt_owned")) {
+        self.profile_system_prompt_owned = owned_prompt != null;
+    }
+}
+
+fn activeRuntimeProviderName(self: anytype) ?[]const u8 {
+    if (@hasField(@TypeOf(self.*), "provider")) {
+        return self.provider.getName();
+    }
+    if (@hasField(@TypeOf(self.*), "default_provider")) {
+        return self.default_provider;
+    }
+    return null;
+}
+
 fn isConfiguredProviderName(self: anytype, provider_name: []const u8) bool {
     if (!@hasField(@TypeOf(self.*), "configured_providers")) return false;
     for (self.configured_providers) |entry| {
-        if (std.ascii.eqlIgnoreCase(entry.name, provider_name)) return true;
+        if (provider_names.providerNamesMatchIgnoreCase(entry.name, provider_name)) return true;
     }
     return false;
 }
@@ -180,6 +339,16 @@ fn invalidateSystemPromptCache(self: anytype) void {
     }
     if (@hasField(@TypeOf(self.*), "system_prompt_has_conversation_context")) {
         self.system_prompt_has_conversation_context = false;
+    }
+    if (@hasField(@TypeOf(self.*), "workspace_prompt_fingerprint")) {
+        self.workspace_prompt_fingerprint = null;
+    }
+    if (@hasField(@TypeOf(self.*), "system_prompt_conversation_context_fingerprint")) {
+        self.system_prompt_conversation_context_fingerprint = null;
+    }
+    if (@hasField(@TypeOf(self.*), "system_prompt_model_name")) {
+        if (self.system_prompt_model_name) |model_name| self.allocator.free(model_name);
+        self.system_prompt_model_name = null;
     }
 }
 
@@ -254,18 +423,6 @@ test "configPrimaryModelForSelection keeps explicit configured custom provider p
     try std.testing.expectEqualStrings("customgw/model-a", primary);
 }
 
-test "parseSlashCommand strips bot mention from command name" {
-    const parsed = parseSlashCommand("/model@nullclaw_bot openrouter/inception/mercury") orelse return error.TestExpectedEqual;
-    try std.testing.expectEqualStrings("model", parsed.name);
-    try std.testing.expectEqualStrings("openrouter/inception/mercury", parsed.arg);
-}
-
-test "parseSlashCommand strips bot mention with colon separator" {
-    const parsed = parseSlashCommand("/model@nullclaw_bot: gpt-5.2") orelse return error.TestExpectedEqual;
-    try std.testing.expectEqualStrings("model", parsed.name);
-    try std.testing.expectEqualStrings("gpt-5.2", parsed.arg);
-}
-
 test "bareSessionResetPrompt returns prompt for bare /new" {
     const prompt = bareSessionResetPrompt("/new") orelse return error.TestExpectedEqual;
     try std.testing.expect(std.mem.indexOf(u8, prompt, "Execute your Session Startup sequence now") != null);
@@ -278,6 +435,34 @@ test "bareSessionResetPrompt returns prompt for bare /reset with mention" {
 
 test "bareSessionResetPrompt ignores /reset with argument" {
     try std.testing.expect(bareSessionResetPrompt("/reset gpt-4o-mini") == null);
+}
+
+test "planTurnInput routes bare reset through local clear and llm prompt" {
+    const plan = planTurnInput("/reset@nullclaw_bot:");
+    try std.testing.expect(plan.clear_session);
+    try std.testing.expect(plan.invoke_local_handler);
+    try std.testing.expectEqualStrings(BARE_SESSION_RESET_PROMPT, plan.llm_user_message.?);
+}
+
+test "planTurnInput keeps unknown slash-prefixed text on llm path" {
+    const plan = planTurnInput("/etc/hosts");
+    try std.testing.expect(!plan.clear_session);
+    try std.testing.expect(!plan.invoke_local_handler);
+    try std.testing.expectEqualStrings("/etc/hosts", plan.llm_user_message.?);
+}
+
+test "planTurnInput keeps known slash commands local-only" {
+    const plan = planTurnInput("/help");
+    try std.testing.expect(!plan.clear_session);
+    try std.testing.expect(plan.invoke_local_handler);
+    try std.testing.expect(plan.llm_user_message == null);
+}
+
+test "planTurnInput keeps /menu on local-only path" {
+    const plan = planTurnInput("/menu");
+    try std.testing.expect(!plan.clear_session);
+    try std.testing.expect(plan.invoke_local_handler);
+    try std.testing.expect(plan.llm_user_message == null);
 }
 
 test "hotApplyConfigChange updates model primary as provider plus model" {
@@ -415,6 +600,281 @@ test "hotApplyConfigChange updates agent status_show_emojis" {
     try std.testing.expect(!dummy.status_show_emojis);
 }
 
+test "applyHotReloadConfig restores resolved defaults and invalidates prompt cache" {
+    const allocator = std.testing.allocator;
+
+    var dummy = struct {
+        allocator: std.mem.Allocator,
+        model_name: []const u8,
+        model_name_owned: bool,
+        default_provider: []const u8,
+        default_provider_owned: bool,
+        default_model: []const u8,
+        temperature: f64,
+        max_tool_iterations: u32,
+        max_history_messages: u32,
+        message_timeout_secs: u64,
+        status_show_emojis: bool,
+        has_system_prompt: bool,
+        system_prompt_has_conversation_context: bool,
+        workspace_prompt_fingerprint: ?u64,
+        system_prompt_model_name: ?[]u8,
+    }{
+        .allocator = allocator,
+        .model_name = "stale-model",
+        .model_name_owned = false,
+        .default_provider = "stale-provider",
+        .default_provider_owned = false,
+        .default_model = "stale-model",
+        .temperature = 1.5,
+        .max_tool_iterations = 1,
+        .max_history_messages = 2,
+        .message_timeout_secs = 3,
+        .status_show_emojis = false,
+        .has_system_prompt = true,
+        .system_prompt_has_conversation_context = true,
+        .workspace_prompt_fingerprint = 1234,
+        .system_prompt_model_name = try allocator.dupe(u8, "stale-model"),
+    };
+    defer if (dummy.model_name_owned) allocator.free(dummy.model_name);
+    defer if (dummy.default_provider_owned) allocator.free(dummy.default_provider);
+    defer if (dummy.system_prompt_model_name) |model_name| allocator.free(model_name);
+
+    var cfg = config_module.Config{
+        .workspace_dir = "/tmp/nullclaw-test",
+        .config_path = "/tmp/nullclaw-test/config.json",
+        .default_provider = "openrouter",
+        .default_model = "gpt-4o",
+        .allocator = allocator,
+    };
+    cfg.agent.max_tool_iterations = 1000;
+    cfg.agent.max_history_messages = 100;
+    cfg.agent.message_timeout_secs = 600;
+    cfg.agent.status_show_emojis = true;
+
+    const summary = try applyHotReloadConfig(&dummy, &cfg);
+    try std.testing.expectEqual(@as(usize, 6), summary.attempted);
+    try std.testing.expectEqual(@as(usize, 6), summary.applied);
+    try std.testing.expectEqual(@as(usize, 0), summary.skipped);
+    try std.testing.expectEqual(@as(usize, 0), summary.failed);
+
+    try std.testing.expectEqualStrings("gpt-4o", dummy.model_name);
+    try std.testing.expectEqualStrings("gpt-4o", dummy.default_model);
+    try std.testing.expectEqualStrings("openrouter", dummy.default_provider);
+    try std.testing.expectEqual(@as(f64, 0.7), dummy.temperature);
+    try std.testing.expectEqual(@as(u32, 1000), dummy.max_tool_iterations);
+    try std.testing.expectEqual(@as(u32, 100), dummy.max_history_messages);
+    try std.testing.expectEqual(@as(u64, 600), dummy.message_timeout_secs);
+    try std.testing.expect(dummy.status_show_emojis);
+    try std.testing.expect(!dummy.has_system_prompt);
+    try std.testing.expect(!dummy.system_prompt_has_conversation_context);
+    try std.testing.expect(dummy.workspace_prompt_fingerprint == null);
+    try std.testing.expect(dummy.system_prompt_model_name == null);
+}
+
+const HotReloadProviderStub = struct {
+    name: []const u8,
+
+    fn provider(self: *@This()) providers.Provider {
+        return .{
+            .ptr = self,
+            .vtable = &vtable,
+        };
+    }
+
+    fn chatWithSystem(
+        _: *anyopaque,
+        allocator: std.mem.Allocator,
+        _: ?[]const u8,
+        _: []const u8,
+        _: []const u8,
+        _: f64,
+    ) anyerror![]const u8 {
+        return allocator.dupe(u8, "");
+    }
+
+    fn chat(
+        _: *anyopaque,
+        allocator: std.mem.Allocator,
+        _: providers.ChatRequest,
+        _: []const u8,
+        _: f64,
+    ) anyerror!providers.ChatResponse {
+        return .{
+            .content = try allocator.dupe(u8, ""),
+            .tool_calls = &.{},
+            .usage = .{},
+            .model = try allocator.dupe(u8, "test-model"),
+        };
+    }
+
+    fn supportsNativeTools(_: *anyopaque) bool {
+        return false;
+    }
+
+    fn getName(ptr: *anyopaque) []const u8 {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return self.name;
+    }
+
+    fn deinitFn(_: *anyopaque) void {}
+
+    const vtable = providers.Provider.VTable{
+        .chatWithSystem = chatWithSystem,
+        .chat = chat,
+        .supportsNativeTools = supportsNativeTools,
+        .getName = getName,
+        .deinit = deinitFn,
+    };
+};
+
+test "applyHotReloadConfig updates active profile overrides when runtime provider matches" {
+    const allocator = std.testing.allocator;
+
+    var provider_stub = HotReloadProviderStub{ .name = "ollama" };
+    var dummy = struct {
+        allocator: std.mem.Allocator,
+        provider: providers.Provider,
+        profile_name: ?[]const u8,
+        profile_system_prompt: ?[]const u8,
+        profile_system_prompt_owned: bool,
+        model_name: []const u8,
+        model_name_owned: bool,
+        default_provider: []const u8,
+        default_provider_owned: bool,
+        default_model: []const u8,
+        temperature: f64,
+        has_system_prompt: bool,
+        system_prompt_has_conversation_context: bool,
+        workspace_prompt_fingerprint: ?u64,
+        system_prompt_model_name: ?[]u8,
+    }{
+        .allocator = allocator,
+        .provider = provider_stub.provider(),
+        .profile_name = "coder",
+        .profile_system_prompt = "Old profile prompt",
+        .profile_system_prompt_owned = false,
+        .model_name = "qwen2.5-coder:7b",
+        .model_name_owned = false,
+        .default_provider = "ollama",
+        .default_provider_owned = false,
+        .default_model = "qwen2.5-coder:7b",
+        .temperature = 0.2,
+        .has_system_prompt = true,
+        .system_prompt_has_conversation_context = true,
+        .workspace_prompt_fingerprint = 99,
+        .system_prompt_model_name = try allocator.dupe(u8, "old-model"),
+    };
+    defer if (dummy.model_name_owned) allocator.free(dummy.model_name);
+    defer if (dummy.default_provider_owned) allocator.free(dummy.default_provider);
+    defer if (dummy.profile_system_prompt_owned and dummy.profile_system_prompt != null) allocator.free(dummy.profile_system_prompt.?);
+    defer if (dummy.system_prompt_model_name) |model_name| allocator.free(model_name);
+
+    const agents = [_]config_types.NamedAgentConfig{
+        .{
+            .name = "coder",
+            .provider = "ollama",
+            .model = "qwen2.5-coder:14b",
+            .system_prompt = "New profile prompt",
+            .temperature = 0.4,
+        },
+    };
+    const cfg = config_module.Config{
+        .workspace_dir = "/tmp/nullclaw-test",
+        .config_path = "/tmp/nullclaw-test/config.json",
+        .default_provider = "openrouter",
+        .default_model = "gpt-4o",
+        .default_temperature = 0.7,
+        .agents = &agents,
+        .allocator = allocator,
+    };
+
+    const summary = try applyHotReloadConfig(&dummy, &cfg);
+    try std.testing.expectEqual(@as(usize, 8), summary.attempted);
+    try std.testing.expectEqual(@as(usize, 4), summary.applied);
+    try std.testing.expectEqual(@as(usize, 5), summary.skipped);
+    try std.testing.expectEqual(@as(usize, 0), summary.failed);
+
+    try std.testing.expectEqualStrings("qwen2.5-coder:14b", dummy.model_name);
+    try std.testing.expectEqualStrings("qwen2.5-coder:14b", dummy.default_model);
+    try std.testing.expectEqualStrings("ollama", dummy.default_provider);
+    try std.testing.expectEqualStrings("New profile prompt", dummy.profile_system_prompt.?);
+    try std.testing.expect(dummy.profile_system_prompt_owned);
+    try std.testing.expectEqual(@as(f64, 0.4), dummy.temperature);
+    try std.testing.expect(!dummy.has_system_prompt);
+    try std.testing.expect(!dummy.system_prompt_has_conversation_context);
+    try std.testing.expect(dummy.workspace_prompt_fingerprint == null);
+    try std.testing.expect(dummy.system_prompt_model_name == null);
+}
+
+test "applyHotReloadConfig clears removed profile overrides and skips provider rebuilds" {
+    const allocator = std.testing.allocator;
+
+    var provider_stub = HotReloadProviderStub{ .name = "ollama" };
+    var dummy = struct {
+        allocator: std.mem.Allocator,
+        provider: providers.Provider,
+        profile_name: ?[]const u8,
+        profile_system_prompt: ?[]const u8,
+        profile_system_prompt_owned: bool,
+        model_name: []const u8,
+        model_name_owned: bool,
+        default_provider: []const u8,
+        default_provider_owned: bool,
+        default_model: []const u8,
+        temperature: f64,
+    }{
+        .allocator = allocator,
+        .provider = provider_stub.provider(),
+        .profile_name = "coder",
+        .profile_system_prompt = try allocator.dupe(u8, "Old profile prompt"),
+        .profile_system_prompt_owned = true,
+        .model_name = "qwen2.5-coder:7b",
+        .model_name_owned = false,
+        .default_provider = "ollama",
+        .default_provider_owned = false,
+        .default_model = "qwen2.5-coder:7b",
+        .temperature = 0.2,
+    };
+    defer if (dummy.model_name_owned) allocator.free(dummy.model_name);
+    defer if (dummy.default_provider_owned) allocator.free(dummy.default_provider);
+    defer if (dummy.profile_system_prompt_owned and dummy.profile_system_prompt != null) allocator.free(dummy.profile_system_prompt.?);
+
+    const agents = [_]config_types.NamedAgentConfig{
+        .{
+            .name = "coder",
+            .provider = "openai",
+            .model = "gpt-4.1-mini",
+            .system_prompt = null,
+            .temperature = null,
+        },
+    };
+    const cfg = config_module.Config{
+        .workspace_dir = "/tmp/nullclaw-test",
+        .config_path = "/tmp/nullclaw-test/config.json",
+        .default_provider = "openrouter",
+        .default_model = "gpt-4o",
+        .default_temperature = 0.7,
+        .agents = &agents,
+        .allocator = allocator,
+    };
+
+    // Regression: profile reload must not free borrowed prompt memory or fake a provider switch
+    // when the session would still be bound to the old provider runtime.
+    const summary = try applyHotReloadConfig(&dummy, &cfg);
+    try std.testing.expectEqual(@as(usize, 6), summary.attempted);
+    try std.testing.expectEqual(@as(usize, 2), summary.applied);
+    try std.testing.expectEqual(@as(usize, 7), summary.skipped);
+    try std.testing.expectEqual(@as(usize, 0), summary.failed);
+
+    try std.testing.expectEqualStrings("qwen2.5-coder:7b", dummy.model_name);
+    try std.testing.expectEqualStrings("qwen2.5-coder:7b", dummy.default_model);
+    try std.testing.expectEqualStrings("ollama", dummy.default_provider);
+    try std.testing.expect(dummy.profile_system_prompt == null);
+    try std.testing.expect(!dummy.profile_system_prompt_owned);
+    try std.testing.expectEqual(@as(f64, 0.7), dummy.temperature);
+}
+
 test "splitPrimaryModelRef parses provider model format" {
     const parsed = splitPrimaryModelRef("openrouter/inception/mercury") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("openrouter", parsed.provider);
@@ -503,6 +963,183 @@ fn splitFirstToken(arg: []const u8) struct { head: []const u8, tail: []const u8 
         .head = trimmed[0..i],
         .tail = std.mem.trim(u8, trimmed[i + 1 ..], " \t"),
     };
+}
+
+fn isSkillNameSeparator(ch: u8) bool {
+    return ch == '-' or ch == '_' or std.ascii.isWhitespace(ch);
+}
+
+fn nextSkillNameToken(name: []const u8, index: *usize) ?[]const u8 {
+    while (index.* < name.len and isSkillNameSeparator(name[index.*])) : (index.* += 1) {}
+    if (index.* >= name.len) return null;
+
+    const start = index.*;
+    while (index.* < name.len and !isSkillNameSeparator(name[index.*])) : (index.* += 1) {}
+    return name[start..index.*];
+}
+
+fn skillNamesEqualNormalized(left: []const u8, right: []const u8) bool {
+    var i: usize = 0;
+    var j: usize = 0;
+
+    while (true) {
+        const left_token = nextSkillNameToken(left, &i);
+        const right_token = nextSkillNameToken(right, &j);
+
+        if (left_token == null or right_token == null) {
+            return left_token == null and right_token == null;
+        }
+        if (!std.ascii.eqlIgnoreCase(left_token.?, right_token.?)) return false;
+    }
+}
+
+const SkillLookup = union(enum) {
+    not_found,
+    ambiguous,
+    unique: *const skills_mod.Skill,
+};
+
+fn findSkillByExactName(skills: []const skills_mod.Skill, name: []const u8) ?*const skills_mod.Skill {
+    for (skills) |*skill| {
+        if (std.ascii.eqlIgnoreCase(skill.name, name)) return skill;
+    }
+    return null;
+}
+
+fn findSkillByNameNormalized(skills: []const skills_mod.Skill, name: []const u8) SkillLookup {
+    if (findSkillByExactName(skills, name)) |skill| {
+        return .{ .unique = skill };
+    }
+
+    var match: ?*const skills_mod.Skill = null;
+    for (skills) |*skill| {
+        if (!skillNamesEqualNormalized(skill.name, name)) continue;
+        if (match != null) return .ambiguous;
+        match = skill;
+    }
+
+    if (match) |skill| return .{ .unique = skill };
+    return .not_found;
+}
+
+fn formatAmbiguousSkillName(self: anytype, name: []const u8) ![]const u8 {
+    return try std.fmt.allocPrint(self.allocator, "Ambiguous skill name: {s}", .{name});
+}
+
+const DirectSkillCommandMatch = struct {
+    skill: *const skills_mod.Skill,
+    user_input: []const u8,
+};
+
+fn registerDirectSkillCommandMatch(
+    match: *?DirectSkillCommandMatch,
+    skill: *const skills_mod.Skill,
+    user_input: []const u8,
+) bool {
+    if (match.*) |existing| {
+        if (existing.skill != skill) return false;
+        return true;
+    }
+    match.* = .{
+        .skill = skill,
+        .user_input = user_input,
+    };
+    return true;
+}
+
+fn executeSkillInvocation(self: anytype, skill: *const skills_mod.Skill, user_input: []const u8) ![]const u8 {
+    if (!skill.available) {
+        return try std.fmt.allocPrint(
+            self.allocator,
+            "Skill {s} is unavailable: {s}",
+            .{ skill.name, skill.missing_deps },
+        );
+    }
+
+    if (user_input.len == 0) {
+        if (skill.instructions.len > 0) {
+            return try std.fmt.allocPrint(
+                self.allocator,
+                "Skill {s}: {s}\nUsage: /skill {s} <task>",
+                .{ skill.name, if (skill.description.len > 0) skill.description else "no description", skill.name },
+            );
+        }
+        return try std.fmt.allocPrint(
+            self.allocator,
+            "Skill {s} has no instructions. Usage: /skill {s} <task>",
+            .{ skill.name, skill.name },
+        );
+    }
+
+    const composed = if (skill.instructions.len > 0)
+        try std.fmt.allocPrint(
+            self.allocator,
+            "Apply the skill `{s}`.\n\nSkill instructions:\n{s}\n\nTask:\n{s}",
+            .{ skill.name, skill.instructions, user_input },
+        )
+    else
+        try std.fmt.allocPrint(
+            self.allocator,
+            "Apply the skill `{s}`.\n\nTask:\n{s}",
+            .{ skill.name, user_input },
+        );
+    defer self.allocator.free(composed);
+
+    if (findSubagentManager(self) != null) {
+        return try spawnSubagentTask(self, composed, skill.name, null);
+    }
+    return try std.fmt.allocPrint(
+        self.allocator,
+        "Skill prompt prepared for `{s}` (spawn tool is disabled):\n{s}",
+        .{ skill.name, composed },
+    );
+}
+
+fn tryHandleDirectSkillCommand(self: anytype, cmd: SlashCommand) !?[]const u8 {
+    const skills = skills_mod.listSkills(self.allocator, self.workspace_dir) catch return null;
+    defer skills_mod.freeSkills(self.allocator, skills);
+
+    var resolved: ?DirectSkillCommandMatch = null;
+
+    switch (findSkillByNameNormalized(skills, cmd.name)) {
+        .unique => |skill| {
+            if (!registerDirectSkillCommandMatch(&resolved, skill, cmd.arg)) {
+                return try formatAmbiguousSkillName(self, cmd.name);
+            }
+        },
+        .ambiguous => return try formatAmbiguousSkillName(self, cmd.name),
+        .not_found => {},
+    }
+
+    var composite = std.ArrayListUnmanaged(u8).empty;
+    defer composite.deinit(self.allocator);
+    try composite.appendSlice(self.allocator, cmd.name);
+
+    var remaining = cmd.arg;
+    while (true) {
+        const parsed_arg = splitFirstToken(remaining);
+        if (parsed_arg.head.len == 0) break;
+
+        try composite.append(self.allocator, ' ');
+        try composite.appendSlice(self.allocator, parsed_arg.head);
+
+        switch (findSkillByNameNormalized(skills, composite.items)) {
+            .unique => |skill| {
+                if (!registerDirectSkillCommandMatch(&resolved, skill, parsed_arg.tail)) {
+                    return try formatAmbiguousSkillName(self, composite.items);
+                }
+            },
+            .ambiguous => return try formatAmbiguousSkillName(self, composite.items),
+            .not_found => {},
+        }
+
+        remaining = parsed_arg.tail;
+    }
+
+    if (resolved) |match| {
+        return try executeSkillInvocation(self, match.skill, match.user_input);
+    }
+    return null;
 }
 
 const SUBAGENTS_SPAWN_USAGE = "Usage: /subagents spawn [--agent <name>|--agent=<name>] <task>";
@@ -719,6 +1356,12 @@ fn findShellTool(self: anytype) ?Tool {
 fn clearSessionState(self: anytype) void {
     self.clearHistory();
     clearPendingExecCommand(self);
+    if (@hasField(@TypeOf(self.*), "total_tokens")) {
+        self.total_tokens = 0;
+    }
+    if (@hasField(@TypeOf(self.*), "last_turn_usage")) {
+        self.last_turn_usage = .{};
+    }
 
     if (self.session_store) |store| {
         store.clearAutoSaved(self.memory_session_id) catch {};
@@ -727,10 +1370,14 @@ fn clearSessionState(self: anytype) void {
 
 fn formatWhoAmI(self: anytype) ![]const u8 {
     const session_id = self.memory_session_id orelse "unknown";
+    const profile_name = if (@hasField(@TypeOf(self.*), "profile_name"))
+        self.profile_name orelse "default"
+    else
+        "default";
     return try std.fmt.allocPrint(
         self.allocator,
-        "Session: {s}\nModel: {s}",
-        .{ session_id, self.model_name },
+        "Session: {s}\nAgent profile: {s}\nModel: {s}",
+        .{ session_id, profile_name, self.model_name },
     );
 }
 
@@ -859,8 +1506,8 @@ fn resetRuntimeCommandState(self: anytype) void {
     self.reasoning_mode = .off;
     self.usage_mode = .off;
     self.exec_host = .gateway;
-    self.exec_security = .allowlist;
-    self.exec_ask = .on_miss;
+    self.exec_security = self.default_exec_security;
+    self.exec_ask = self.default_exec_ask;
     if (self.exec_node_id_owned and self.exec_node_id != null) self.allocator.free(self.exec_node_id.?);
     self.exec_node_id = null;
     self.exec_node_id_owned = false;
@@ -908,8 +1555,12 @@ fn formatStatus(self: anytype) ![]const u8 {
     const activation_label = if (show_emojis) "📡 Activation" else "Activation";
     const send_label = if (show_emojis) "📤 Send" else "Send";
     const ttl_label = if (show_emojis) "⏰ Session TTL" else "Session TTL";
+    const tasks_label = if (show_emojis) "🧵 Tasks" else "Tasks";
 
     try w.print("{s}NullClaw {s}\n", .{ title_prefix, version.string });
+    if (@hasField(@TypeOf(self.*), "profile_name")) {
+        try w.print("Agent profile: {s}\n", .{self.profile_name orelse "default"});
+    }
     try w.print("{s}: {s}\n", .{ model_label, self.model_name });
     try w.print("{s}: {d} messages\n", .{ history_label, self.history.items.len });
     try w.print("{s}: {d}\n", .{ tokens_label, self.total_tokens });
@@ -935,6 +1586,34 @@ fn formatStatus(self: anytype) ![]const u8 {
         try w.print("{s}: {d}s\n", .{ ttl_label, ttl });
     } else {
         try w.print("{s}: off\n", .{ttl_label});
+    }
+    if (findSubagentManager(self)) |manager| {
+        manager.mutex.lock();
+        defer manager.mutex.unlock();
+
+        var running: u32 = 0;
+        var completed: u32 = 0;
+        var failed: u32 = 0;
+        var visible: u32 = 0;
+
+        var it = manager.tasks.iterator();
+        while (it.next()) |entry| {
+            const state = entry.value_ptr.*;
+            if (!taskBelongsToCurrentSession(self, state)) continue;
+            visible += 1;
+            switch (state.status) {
+                .running => running += 1,
+                .completed => completed += 1,
+                .failed => failed += 1,
+            }
+        }
+
+        if (visible > 0) {
+            try w.print(
+                "{s}: running={d} completed={d} failed={d}\n",
+                .{ tasks_label, running, completed, failed },
+            );
+        }
     }
     return try out.toOwnedSlice(self.allocator);
 }
@@ -1412,6 +2091,12 @@ fn runShellCommand(self: anytype, command: []const u8, skip_approval_gate: bool)
     if (self.exec_security == .allowlist) {
         if (self.policy) |pol| {
             if (!pol.isCommandAllowed(command)) {
+                const summary = command_summary.summarizeBlockedCommand(command);
+                log.warn("exec blocked by allowlist policy: head={s} bytes={d} assignments={d}", .{
+                    summary.head,
+                    summary.byte_len,
+                    summary.assignment_count,
+                });
                 return try self.allocator.dupe(u8, "Exec blocked by allowlist policy");
             }
         }
@@ -1955,6 +2640,22 @@ fn splitPrimaryModelRef(primary: []const u8) ?struct { provider: []const u8, mod
     };
 }
 
+const hot_reload_paths = [_][]const u8{
+    "agents.defaults.model.primary",
+    "default_temperature",
+    "agent.max_tool_iterations",
+    "agent.max_history_messages",
+    "agent.message_timeout_secs",
+    "agent.status_show_emojis",
+};
+
+const HotReloadSummary = struct {
+    attempted: usize = 0,
+    applied: usize = 0,
+    skipped: usize = 0,
+    failed: usize = 0,
+};
+
 fn hotApplyConfigChange(
     self: anytype,
     action: config_mutator.MutationAction,
@@ -2021,6 +2722,220 @@ fn hotApplyConfigChange(
     }
 
     return false;
+}
+
+fn loadHotReloadConfig(backing_allocator: std.mem.Allocator) !config_module.Config {
+    const arena_ptr = try backing_allocator.create(std.heap.ArenaAllocator);
+    arena_ptr.* = std.heap.ArenaAllocator.init(backing_allocator);
+    errdefer {
+        arena_ptr.deinit();
+        backing_allocator.destroy(arena_ptr);
+    }
+    const allocator = arena_ptr.allocator();
+
+    const config_path = try config_mutator.defaultConfigPath(allocator);
+    const config_dir = std.fs.path.dirname(config_path) orelse return error.InvalidPath;
+    const default_workspace_dir = try std.fs.path.join(allocator, &.{ config_dir, "workspace" });
+
+    var cfg = config_module.Config{
+        .workspace_dir = default_workspace_dir,
+        .config_path = config_path,
+        .allocator = allocator,
+        .arena = arena_ptr,
+    };
+
+    if (std.fs.openFileAbsolute(config_path, .{})) |file| {
+        defer file.close();
+        const content = try file.readToEndAlloc(allocator, 1024 * 64);
+        try cfg.parseJson(content);
+    } else |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    }
+
+    if (cfg.workspace_dir_override != null) {
+        cfg.workspace_dir = cfg.workspace_dir_override.?;
+    }
+
+    if (cfg.channels.nostr) |ns| {
+        ns.config_dir = std.fs.path.dirname(config_path) orelse ".";
+    }
+    {
+        const dir = std.fs.path.dirname(config_path) orelse ".";
+        const teams_mut = @constCast(cfg.channels.teams);
+        for (teams_mut) |*tc| {
+            tc.config_dir = dir;
+        }
+    }
+
+    cfg.applyEnvOverrides();
+    cfg.syncFlatFields();
+    return cfg;
+}
+
+fn hotReloadValueJson(
+    allocator: std.mem.Allocator,
+    cfg: *const config_module.Config,
+    path: []const u8,
+) ![]u8 {
+    if (std.mem.eql(u8, path, "agents.defaults.model.primary")) {
+        const model = cfg.default_model orelse return allocator.dupe(u8, "null");
+        const primary = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ cfg.default_provider, model });
+        defer allocator.free(primary);
+        return try std.json.Stringify.valueAlloc(allocator, std.json.Value{ .string = primary }, .{});
+    }
+
+    if (std.mem.eql(u8, path, "default_temperature")) {
+        return try std.fmt.allocPrint(allocator, "{d}", .{cfg.default_temperature});
+    }
+
+    if (std.mem.eql(u8, path, "agent.max_tool_iterations")) {
+        return try std.fmt.allocPrint(allocator, "{d}", .{cfg.agent.max_tool_iterations});
+    }
+
+    if (std.mem.eql(u8, path, "agent.max_history_messages")) {
+        return try std.fmt.allocPrint(allocator, "{d}", .{cfg.agent.max_history_messages});
+    }
+
+    if (std.mem.eql(u8, path, "agent.message_timeout_secs")) {
+        return try std.fmt.allocPrint(allocator, "{d}", .{cfg.agent.message_timeout_secs});
+    }
+
+    if (std.mem.eql(u8, path, "agent.status_show_emojis")) {
+        return try allocator.dupe(u8, if (cfg.agent.status_show_emojis) "true" else "false");
+    }
+
+    return error.InvalidPath;
+}
+
+fn applyHotReloadConfig(self: anytype, cfg: *const config_module.Config) !HotReloadSummary {
+    var summary = HotReloadSummary{};
+    const has_active_profile = @hasField(@TypeOf(self.*), "profile_name") and self.profile_name != null;
+
+    for (hot_reload_paths) |path| {
+        if (has_active_profile and std.mem.eql(u8, path, "agents.defaults.model.primary")) {
+            summary.skipped += 1;
+            continue;
+        }
+
+        const value_json = hotReloadValueJson(self.allocator, cfg, path) catch {
+            summary.failed += 1;
+            continue;
+        };
+        defer self.allocator.free(value_json);
+
+        if (std.mem.eql(u8, std.mem.trim(u8, value_json, " \t\r\n"), "null")) {
+            summary.skipped += 1;
+            continue;
+        }
+
+        summary.attempted += 1;
+        const hot_applied = hotApplyConfigChange(self, .set, path, value_json) catch {
+            summary.failed += 1;
+            continue;
+        };
+        if (hot_applied) {
+            summary.applied += 1;
+        } else {
+            summary.skipped += 1;
+        }
+    }
+
+    // Profile-aware reload: only hot-apply profile settings that can be reconciled
+    // with the current runtime provider. Provider swaps still require a fresh session.
+    if (@hasField(@TypeOf(self.*), "profile_name")) {
+        if (self.profile_name) |pname| {
+            for (cfg.agents) |*acfg| {
+                if (std.mem.eql(u8, acfg.name, pname)) {
+                    const runtime_provider_name = activeRuntimeProviderName(self) orelse "";
+                    const provider_matches_runtime = provider_names.providerNamesMatchIgnoreCase(
+                        runtime_provider_name,
+                        acfg.provider,
+                    );
+
+                    if (@hasField(@TypeOf(self.*), "default_provider") and
+                        !provider_names.providerNamesMatchIgnoreCase(self.default_provider, acfg.provider))
+                    {
+                        if (provider_matches_runtime) {
+                            summary.attempted += 1;
+                            const provider_updated = blk: {
+                                setDefaultProvider(self, acfg.provider) catch |err| {
+                                    summary.failed += 1;
+                                    log.warn("Hot reload profile provider metadata update failed: {}", .{err});
+                                    break :blk false;
+                                };
+                                break :blk true;
+                            };
+                            if (provider_updated) summary.applied += 1;
+                        } else {
+                            summary.skipped += 1;
+                            log.warn(
+                                "Hot reload skipped profile provider change for {s}: runtime provider {s} requires a fresh session to switch to {s}",
+                                .{ pname, runtime_provider_name, acfg.provider },
+                            );
+                        }
+                    }
+
+                    if (!std.mem.eql(u8, self.model_name, acfg.model)) {
+                        if (!provider_matches_runtime) {
+                            summary.skipped += 1;
+                            log.warn(
+                                "Hot reload skipped profile model update for {s}: provider switch to {s} was not applied",
+                                .{ pname, acfg.provider },
+                            );
+                        } else {
+                            summary.attempted += 1;
+                            const model_updated = blk: {
+                                setModelName(self, acfg.model) catch |err| {
+                                    summary.failed += 1;
+                                    log.warn("Hot reload profile model update failed: {}", .{err});
+                                    break :blk false;
+                                };
+                                break :blk true;
+                            };
+                            if (model_updated) {
+                                if (@hasField(@TypeOf(self.*), "default_model")) {
+                                    self.default_model = self.model_name;
+                                }
+                                summary.applied += 1;
+                            }
+                        }
+                    }
+
+                    if (@hasField(@TypeOf(self.*), "profile_system_prompt")) {
+                        const old_prompt = self.profile_system_prompt orelse "";
+                        const new_prompt = acfg.system_prompt orelse "";
+                        if (!std.mem.eql(u8, old_prompt, new_prompt)) {
+                            summary.attempted += 1;
+                            const prompt_updated = blk: {
+                                setProfileSystemPrompt(self, if (new_prompt.len > 0) new_prompt else null) catch |err| {
+                                    summary.failed += 1;
+                                    log.warn("Hot reload profile system prompt update failed: {}", .{err});
+                                    break :blk false;
+                                };
+                                break :blk true;
+                            };
+                            if (prompt_updated) summary.applied += 1;
+                        }
+                    }
+
+                    const new_temp = acfg.temperature orelse cfg.default_temperature;
+                    if (self.temperature != new_temp) {
+                        summary.attempted += 1;
+                        self.temperature = new_temp;
+                        summary.applied += 1;
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    if (summary.applied > 0) {
+        invalidateSystemPromptCache(self);
+    }
+
+    return summary;
 }
 
 fn formatConfigMutationResponse(
@@ -2119,6 +3034,40 @@ fn handleConfigCommand(self: anytype, arg: []const u8) ![]const u8 {
         return try self.allocator.dupe(u8, "Config validation: OK");
     }
 
+    if (std.ascii.eqlIgnoreCase(action, "reload") or std.ascii.eqlIgnoreCase(action, "refresh")) {
+        if (std.mem.trim(u8, parsed.tail, " \t").len > 0) {
+            return try self.allocator.dupe(u8, "Usage: /config reload");
+        }
+
+        var validation_failed = false;
+        config_mutator.validateCurrentConfig(self.allocator) catch {
+            validation_failed = true;
+        };
+
+        var summary = HotReloadSummary{};
+        if (validation_failed) {
+            summary.failed = 1;
+        } else {
+            var cfg = loadHotReloadConfig(self.allocator) catch {
+                summary.failed = 1;
+                return try std.fmt.allocPrint(
+                    self.allocator,
+                    "Config hot reload complete: attempted={d} applied={d} skipped={d} failed={d} validation_failed={s}",
+                    .{ summary.attempted, summary.applied, summary.skipped, summary.failed, "false" },
+                );
+            };
+            defer cfg.deinit();
+
+            summary = try applyHotReloadConfig(self, &cfg);
+        }
+
+        return try std.fmt.allocPrint(
+            self.allocator,
+            "Config hot reload complete: attempted={d} applied={d} skipped={d} failed={d} validation_failed={s}",
+            .{ summary.attempted, summary.applied, summary.skipped, summary.failed, if (validation_failed) "true" else "false" },
+        );
+    }
+
     if (std.ascii.eqlIgnoreCase(action, "set")) {
         const path_and_value = splitFirstToken(parsed.tail);
         const path = path_and_value.head;
@@ -2204,18 +3153,27 @@ fn handleConfigCommand(self: anytype, arg: []const u8) ![]const u8 {
             "  /config unset <path>                  (dry-run preview)\n" ++
             "  /config apply set <path> <value>\n" ++
             "  /config apply unset <path>\n" ++
+            "  /config reload                        (hot reload supported keys)\n" ++
             "  /config validate",
     );
 }
 
 fn handleSkillCommand(self: anytype, arg: []const u8) ![]const u8 {
+    const parsed = splitFirstToken(arg);
+    const action_or_name = parsed.head;
+
+    if (std.ascii.eqlIgnoreCase(action_or_name, "reload") or std.ascii.eqlIgnoreCase(action_or_name, "refresh")) {
+        if (std.mem.trim(u8, parsed.tail, " \t").len > 0) {
+            return try self.allocator.dupe(u8, "Usage: /skill reload");
+        }
+        invalidateSystemPromptCache(self);
+        return try self.allocator.dupe(u8, "Skills reloaded for this session. Updated skill instructions will apply on the next turn.");
+    }
+
     const skills = skills_mod.listSkills(self.allocator, self.workspace_dir) catch |err| {
         return try std.fmt.allocPrint(self.allocator, "Failed to load skills: {s}", .{@errorName(err)});
     };
     defer skills_mod.freeSkills(self.allocator, skills);
-
-    const parsed = splitFirstToken(arg);
-    const action_or_name = parsed.head;
 
     if (action_or_name.len == 0 or std.ascii.eqlIgnoreCase(action_or_name, "list")) {
         if (skills.len == 0) {
@@ -2234,62 +3192,11 @@ fn handleSkillCommand(self: anytype, arg: []const u8) ![]const u8 {
         return try out.toOwnedSlice(self.allocator);
     }
 
-    var selected: ?*const skills_mod.Skill = null;
-    for (skills) |*skill| {
-        if (std.ascii.eqlIgnoreCase(skill.name, action_or_name)) {
-            selected = skill;
-            break;
-        }
+    switch (findSkillByNameNormalized(skills, action_or_name)) {
+        .unique => |skill| return try executeSkillInvocation(self, skill, std.mem.trim(u8, parsed.tail, " \t")),
+        .ambiguous => return try formatAmbiguousSkillName(self, action_or_name),
+        .not_found => return try std.fmt.allocPrint(self.allocator, "Skill not found: {s}", .{action_or_name}),
     }
-    const skill = selected orelse
-        return try std.fmt.allocPrint(self.allocator, "Skill not found: {s}", .{action_or_name});
-
-    if (!skill.available) {
-        return try std.fmt.allocPrint(
-            self.allocator,
-            "Skill {s} is unavailable: {s}",
-            .{ skill.name, skill.missing_deps },
-        );
-    }
-
-    const user_input = std.mem.trim(u8, parsed.tail, " \t");
-    if (user_input.len == 0) {
-        if (skill.instructions.len > 0) {
-            return try std.fmt.allocPrint(
-                self.allocator,
-                "Skill {s}: {s}\nUsage: /skill {s} <task>",
-                .{ skill.name, if (skill.description.len > 0) skill.description else "no description", skill.name },
-            );
-        }
-        return try std.fmt.allocPrint(
-            self.allocator,
-            "Skill {s} has no instructions. Usage: /skill {s} <task>",
-            .{ skill.name, skill.name },
-        );
-    }
-
-    const composed = if (skill.instructions.len > 0)
-        try std.fmt.allocPrint(
-            self.allocator,
-            "Apply the skill `{s}`.\n\nSkill instructions:\n{s}\n\nTask:\n{s}",
-            .{ skill.name, skill.instructions, user_input },
-        )
-    else
-        try std.fmt.allocPrint(
-            self.allocator,
-            "Apply the skill `{s}`.\n\nTask:\n{s}",
-            .{ skill.name, user_input },
-        );
-    defer self.allocator.free(composed);
-
-    if (findSubagentManager(self) != null) {
-        return try spawnSubagentTask(self, composed, skill.name, null);
-    }
-    return try std.fmt.allocPrint(
-        self.allocator,
-        "Skill prompt prepared for `{s}` (spawn tool is disabled):\n{s}",
-        .{ skill.name, composed },
-    );
 }
 
 fn handleBashCommand(self: anytype, arg: []const u8) ![]const u8 {
@@ -2332,6 +3239,12 @@ pub fn execBlockMessage(self: anytype, args: std.json.ObjectMap) ?[]const u8 {
                 const command = v.string;
                 if (self.policy) |pol| {
                     if (!pol.isCommandAllowed(command)) {
+                        const summary = command_summary.summarizeBlockedCommand(command);
+                        log.warn("tool exec blocked by allowlist policy: head={s} bytes={d} assignments={d}", .{
+                            summary.head,
+                            summary.byte_len,
+                            summary.assignment_count,
+                        });
                         return "Exec blocked by allowlist policy";
                     }
                 }
@@ -2391,125 +3304,138 @@ fn handleDoctorCommand(self: anytype) ![]const u8 {
 
 pub fn handleSlashCommand(self: anytype, message: []const u8) !?[]const u8 {
     const cmd = parseSlashCommand(message) orelse return null;
-
-    if (isSlashName(cmd, "new") or isSlashName(cmd, "reset")) {
-        clearSessionState(self);
-        if (cmd.arg.len > 0) {
-            try setModelName(self, cmd.arg);
-            return try std.fmt.allocPrint(self.allocator, "Session cleared. Switched to model: {s}", .{cmd.arg});
-        }
-        return try self.allocator.dupe(u8, "Session cleared.");
-    }
-
-    if (isSlashName(cmd, "restart")) {
-        clearSessionState(self);
-        resetRuntimeCommandState(self);
-        if (cmd.arg.len > 0) {
-            try setModelName(self, cmd.arg);
-            return try std.fmt.allocPrint(self.allocator, "Session restarted. Switched to model: {s}", .{cmd.arg});
-        }
-        return try self.allocator.dupe(u8, "Session restarted.");
-    }
-
-    if (isSlashName(cmd, "help") or isSlashName(cmd, "commands")) {
-        return try self.allocator.dupe(u8,
-            \\Available commands:
-            \\  /new, /reset [model], /restart [model]
-            \\  /help, /commands, /status, /whoami, /id
-            \\  /model, /models, /model <name>
-            \\  /think, /verbose, /reasoning
-            \\  /exec, /queue, /usage, /tts, /voice
-            \\  /stop, /abort, /compact
-            \\  /allowlist, /approve, /context
-            \\  /export-session, /export
-            \\  /session ttl <duration|off>
-            \\  /subagents, /agents, /focus, /unfocus, /kill, /steer, /tell
-            \\  /config, /capabilities, /debug
-            \\  /dock-telegram, /dock-discord, /dock-slack
-            \\  /activation, /send, /elevated, /bash, /poll, /skill
-            \\  /doctor — memory subsystem diagnostics
-            \\  /memory <stats|status|reindex|count|search|get|list|drain-outbox>
-            \\  exit, quit
-        );
-    }
-
-    if (isSlashName(cmd, "status")) return try formatStatus(self);
-    if (isSlashName(cmd, "whoami") or isSlashName(cmd, "id")) return try formatWhoAmI(self);
-    if (isSlashName(cmd, "model") or isSlashName(cmd, "models")) {
-        if (cmd.arg.len == 0 or
-            std.ascii.eqlIgnoreCase(cmd.arg, "list") or
-            std.ascii.eqlIgnoreCase(cmd.arg, "status"))
-        {
-            return try self.formatModelStatus();
-        }
-        try setModelName(self, cmd.arg);
-        if (@hasField(@TypeOf(self.*), "default_model")) {
-            self.default_model = self.model_name;
-        }
-        invalidateSystemPromptCache(self);
-        persistSelectedModelToConfig(self, cmd.arg) catch |err| {
-            return try std.fmt.allocPrint(
-                self.allocator,
-                "Switched to model: {s}\nWarning: could not persist model to config.json ({s})",
-                .{ cmd.arg, @errorName(err) },
-            );
-        };
-        return try std.fmt.allocPrint(self.allocator, "Switched to model: {s}", .{cmd.arg});
-    }
-
-    if (isSlashName(cmd, "think") or isSlashName(cmd, "thinking") or isSlashName(cmd, "t")) return try handleThinkCommand(self, cmd.arg);
-    if (isSlashName(cmd, "verbose") or isSlashName(cmd, "v")) return try handleVerboseCommand(self, cmd.arg);
-    if (isSlashName(cmd, "reasoning") or isSlashName(cmd, "reason")) return try handleReasoningCommand(self, cmd.arg);
-    if (isSlashName(cmd, "exec")) return try handleExecCommand(self, cmd.arg);
-    if (isSlashName(cmd, "queue")) return try handleQueueCommand(self, cmd.arg);
-    if (isSlashName(cmd, "usage")) return try handleUsageCommand(self, cmd.arg);
-    if (isSlashName(cmd, "tts") or isSlashName(cmd, "voice")) return try handleTtsCommand(self, cmd.arg);
-    if (isSlashName(cmd, "stop") or isSlashName(cmd, "abort")) return try handleStopCommand(self);
-    if (isSlashName(cmd, "compact")) {
-        if (self.forceCompressHistory()) {
-            return try self.allocator.dupe(u8, "Context compacted.");
-        }
-        return try self.allocator.dupe(u8, "Nothing to compact.");
-    }
-
-    if (isSlashName(cmd, "allowlist")) return try handleAllowlistCommand(self, cmd.arg);
-    if (isSlashName(cmd, "approve")) return try handleApproveCommand(self, cmd.arg);
-    if (isSlashName(cmd, "context")) return try handleContextCommand(self, cmd.arg);
-    if (isSlashName(cmd, "export-session") or isSlashName(cmd, "export")) return try handleExportSessionCommand(self, cmd.arg);
-    if (isSlashName(cmd, "session")) return try handleSessionCommand(self, cmd.arg);
-    if (isSlashName(cmd, "subagents")) return try handleSubagentsCommand(self, cmd.arg);
-    if (isSlashName(cmd, "agents")) return try handleAgentsCommand(self);
-    if (isSlashName(cmd, "focus")) return try handleFocusCommand(self, cmd.arg);
-    if (isSlashName(cmd, "unfocus")) return try handleUnfocusCommand(self);
-    if (isSlashName(cmd, "kill")) return try handleKillCommand(self, cmd.arg);
-    if (isSlashName(cmd, "steer")) return try handleSteerCommand(self, cmd.arg);
-    if (isSlashName(cmd, "tell")) return try handleTellCommand(self, cmd.arg);
-
-    if (isSlashName(cmd, "config")) return try handleConfigCommand(self, cmd.arg);
-    if (isSlashName(cmd, "capabilities")) return try handleCapabilitiesCommand(self, cmd.arg);
-    if (isSlashName(cmd, "debug")) {
-        if (std.ascii.eqlIgnoreCase(cmd.arg, "show") or cmd.arg.len == 0) return try formatStatus(self);
-        if (std.ascii.eqlIgnoreCase(cmd.arg, "reset")) {
+    switch (classifySlashCommand(cmd)) {
+        .new_reset => {
+            clearSessionState(self);
+            if (cmd.arg.len > 0) {
+                try setModelName(self, cmd.arg);
+                if (@hasField(@TypeOf(self.*), "model_pinned_by_user")) {
+                    self.model_pinned_by_user = true;
+                }
+                invalidateSystemPromptCache(self);
+                return try std.fmt.allocPrint(self.allocator, "Session cleared. Switched to model: {s}", .{cmd.arg});
+            }
+            return try self.allocator.dupe(u8, "Session cleared.");
+        },
+        .restart => {
+            clearSessionState(self);
             resetRuntimeCommandState(self);
-            return try self.allocator.dupe(u8, "Runtime debug state reset.");
-        }
-        return try self.allocator.dupe(u8, "Supported: /debug show|reset");
+            if (cmd.arg.len > 0) {
+                try setModelName(self, cmd.arg);
+                if (@hasField(@TypeOf(self.*), "model_pinned_by_user")) {
+                    self.model_pinned_by_user = true;
+                }
+                invalidateSystemPromptCache(self);
+                return try std.fmt.allocPrint(self.allocator, "Session restarted. Switched to model: {s}", .{cmd.arg});
+            }
+            return try self.allocator.dupe(u8, "Session restarted.");
+        },
+        .help => return try self.allocator.dupe(u8, control_plane.HELP_TEXT),
+        .status => return try formatStatus(self),
+        .whoami => return try formatWhoAmI(self),
+        .model => {
+            if (cmd.arg.len == 0 or
+                std.ascii.eqlIgnoreCase(cmd.arg, "list") or
+                std.ascii.eqlIgnoreCase(cmd.arg, "status"))
+            {
+                return try self.formatModelStatus();
+            }
+            if (std.ascii.eqlIgnoreCase(cmd.arg, "auto")) {
+                if (@hasField(@TypeOf(self.*), "model_pinned_by_user")) {
+                    self.model_pinned_by_user = false;
+                }
+                if (@hasDecl(@TypeOf(self.*), "clearLastRouteTrace")) {
+                    self.clearLastRouteTrace();
+                }
+                if (@hasField(@TypeOf(self.*), "default_model")) {
+                    try setModelName(self, self.default_model);
+                }
+                invalidateSystemPromptCache(self);
+                if (@hasField(@TypeOf(self.*), "model_routes") and self.model_routes.len == 0) {
+                    return try std.fmt.allocPrint(
+                        self.allocator,
+                        "Automatic model routing is not configured. Reverted to the configured default model: {s}",
+                        .{self.model_name},
+                    );
+                }
+                return try std.fmt.allocPrint(
+                    self.allocator,
+                    "Automatic model routing enabled. Reverted to the configured default model: {s}",
+                    .{self.model_name},
+                );
+            }
+            try setModelName(self, cmd.arg);
+            if (@hasField(@TypeOf(self.*), "model_pinned_by_user")) {
+                self.model_pinned_by_user = true;
+            }
+            if (@hasDecl(@TypeOf(self.*), "clearLastRouteTrace")) {
+                self.clearLastRouteTrace();
+            }
+            if (@hasField(@TypeOf(self.*), "default_model")) {
+                self.default_model = self.model_name;
+            }
+            invalidateSystemPromptCache(self);
+            persistSelectedModelToConfig(self, cmd.arg) catch |err| {
+                return try std.fmt.allocPrint(
+                    self.allocator,
+                    "Switched to model: {s}\nWarning: could not persist model to config.json ({s})",
+                    .{ cmd.arg, @errorName(err) },
+                );
+            };
+            return try std.fmt.allocPrint(self.allocator, "Switched to model: {s}", .{cmd.arg});
+        },
+        .think => return try handleThinkCommand(self, cmd.arg),
+        .verbose => return try handleVerboseCommand(self, cmd.arg),
+        .reasoning => return try handleReasoningCommand(self, cmd.arg),
+        .exec => return try handleExecCommand(self, cmd.arg),
+        .queue => return try handleQueueCommand(self, cmd.arg),
+        .usage => return try handleUsageCommand(self, cmd.arg),
+        .tts => return try handleTtsCommand(self, cmd.arg),
+        .stop => return try handleStopCommand(self),
+        .compact => {
+            if (self.forceCompressHistory()) {
+                return try self.allocator.dupe(u8, "Context compacted.");
+            }
+            return try self.allocator.dupe(u8, "Nothing to compact.");
+        },
+        .allowlist => return try handleAllowlistCommand(self, cmd.arg),
+        .approve => return try handleApproveCommand(self, cmd.arg),
+        .context => return try handleContextCommand(self, cmd.arg),
+        .export_session => return try handleExportSessionCommand(self, cmd.arg),
+        .session => return try handleSessionCommand(self, cmd.arg),
+        .subagents => return try handleSubagentsCommand(self, cmd.arg),
+        .agents => return try handleAgentsCommand(self),
+        .focus => return try handleFocusCommand(self, cmd.arg),
+        .unfocus => return try handleUnfocusCommand(self),
+        .kill => return try handleKillCommand(self, cmd.arg),
+        .steer => return try handleSteerCommand(self, cmd.arg),
+        .tell => return try handleTellCommand(self, cmd.arg),
+        .config => return try handleConfigCommand(self, cmd.arg),
+        .capabilities => return try handleCapabilitiesCommand(self, cmd.arg),
+        .debug => {
+            if (std.ascii.eqlIgnoreCase(cmd.arg, "show") or cmd.arg.len == 0) return try formatStatus(self);
+            if (std.ascii.eqlIgnoreCase(cmd.arg, "reset")) {
+                resetRuntimeCommandState(self);
+                return try self.allocator.dupe(u8, "Runtime debug state reset.");
+            }
+            return try self.allocator.dupe(u8, "Supported: /debug show|reset");
+        },
+        .dock_telegram => return try handleDockCommand(self, "telegram"),
+        .dock_discord => return try handleDockCommand(self, "discord"),
+        .dock_slack => return try handleDockCommand(self, "slack"),
+        .activation => return try handleActivationCommand(self, cmd.arg),
+        .send => return try handleSendCommand(self, cmd.arg),
+        .elevated => return try handleElevatedCommand(self, cmd.arg),
+        .bash => return try handleBashCommand(self, cmd.arg),
+        .poll => return try handlePollCommand(self),
+        .skill => return try handleSkillCommand(self, cmd.arg),
+        .doctor => return try handleDoctorCommand(self),
+        .memory => return try handleMemoryCommand(self, cmd.arg),
+        .unknown => {
+            if (try tryHandleDirectSkillCommand(self, cmd)) |response| return response;
+            return null;
+        },
     }
-
-    if (isSlashName(cmd, "dock-telegram") or isSlashName(cmd, "dock_telegram")) return try handleDockCommand(self, "telegram");
-    if (isSlashName(cmd, "dock-discord") or isSlashName(cmd, "dock_discord")) return try handleDockCommand(self, "discord");
-    if (isSlashName(cmd, "dock-slack") or isSlashName(cmd, "dock_slack")) return try handleDockCommand(self, "slack");
-    if (isSlashName(cmd, "activation")) return try handleActivationCommand(self, cmd.arg);
-    if (isSlashName(cmd, "send")) return try handleSendCommand(self, cmd.arg);
-    if (isSlashName(cmd, "elevated") or isSlashName(cmd, "elev")) return try handleElevatedCommand(self, cmd.arg);
-
-    if (isSlashName(cmd, "bash")) return try handleBashCommand(self, cmd.arg);
-    if (isSlashName(cmd, "poll")) return try handlePollCommand(self);
-    if (isSlashName(cmd, "skill")) return try handleSkillCommand(self, cmd.arg);
-    if (isSlashName(cmd, "doctor")) return try handleDoctorCommand(self);
-    if (isSlashName(cmd, "memory")) return try handleMemoryCommand(self, cmd.arg);
-
-    return null;
 }
 
 fn handleMemoryCommand(self: anytype, arg: []const u8) ![]const u8 {
@@ -2585,7 +3511,7 @@ fn handleMemoryCommand(self: anytype, arg: []const u8) ![]const u8 {
     if (std.mem.eql(u8, sub, "get")) {
         const key = std.mem.trim(u8, rest, " \t");
         if (key.len == 0) return try self.allocator.dupe(u8, "Usage: /memory get <key>");
-        const entry = mem_rt.memory.get(self.allocator, key) catch |err| {
+        const entry = mem_rt.memory.getScoped(self.allocator, key, self.memory_session_id) catch |err| {
             return try std.fmt.allocPrint(self.allocator, "Memory get failed: {s}", .{@errorName(err)});
         };
         if (entry) |e| {
@@ -2618,7 +3544,7 @@ fn handleMemoryCommand(self: anytype, arg: []const u8) ![]const u8 {
         const query = std.mem.trim(u8, query_buf.items, " \t");
         if (query.len == 0) return try self.allocator.dupe(u8, "Usage: /memory search <query> [--limit N]");
 
-        const results = mem_rt.search(self.allocator, query, limit, null) catch |err| {
+        const results = mem_rt.search(self.allocator, query, limit, self.memory_session_id) catch |err| {
             return try std.fmt.allocPrint(self.allocator, "Memory search failed: {s}", .{@errorName(err)});
         };
         defer memory_mod.retrieval.freeCandidates(self.allocator, results);
@@ -2665,7 +3591,7 @@ fn handleMemoryCommand(self: anytype, arg: []const u8) ![]const u8 {
             return try std.fmt.allocPrint(self.allocator, "Unknown option for /memory list: {s}", .{tok});
         }
 
-        const entries = mem_rt.memory.list(self.allocator, category_opt, null) catch |err| {
+        const entries = mem_rt.memory.list(self.allocator, category_opt, self.memory_session_id) catch |err| {
             return try std.fmt.allocPrint(self.allocator, "Memory list failed: {s}", .{@errorName(err)});
         };
         defer memory_mod.freeEntries(self.allocator, entries);

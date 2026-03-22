@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
+const fs_compat = @import("fs_compat.zig");
 
 const MAX_READ_BYTES: usize = 1024 * 1024;
 const MAX_SEARCH_MATCHES: usize = 5;
@@ -138,7 +139,7 @@ fn join_path(allocator: std.mem.Allocator, a: []const u8, b: []const u8) ![]u8 {
 fn ensure_parent_dir(path: []const u8) !void {
     const maybe_parent = std.fs.path.dirname(path);
     if (maybe_parent) |parent| {
-        std.fs.cwd().makePath(parent) catch |err| switch (err) {
+        fs_compat.makePath(parent) catch |err| switch (err) {
             error.PathAlreadyExists => {},
             else => return err,
         };
@@ -181,7 +182,7 @@ fn append_line(path: []const u8, line: []const u8, allocator: std.mem.Allocator)
     const file = try std.fs.cwd().createFile(path, .{ .truncate = false, .read = true });
     defer file.close();
 
-    const stat = try file.stat();
+    const stat = try fs_compat.stat(file);
     const size = stat.size;
     try file.seekTo(size);
 
@@ -202,13 +203,13 @@ fn append_line(path: []const u8, line: []const u8, allocator: std.mem.Allocator)
 }
 
 fn scaffold_workspace(allocator: std.mem.Allocator, workspace: []const u8) !usize {
-    std.fs.cwd().makePath(workspace) catch |err| switch (err) {
+    fs_compat.makePath(workspace) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => return err,
     };
 
     const memory_dir = try join_path(allocator, workspace, "memory");
-    std.fs.cwd().makePath(memory_dir) catch |err| switch (err) {
+    fs_compat.makePath(memory_dir) catch |err| switch (err) {
         error.PathAlreadyExists => {},
         else => return err,
     };

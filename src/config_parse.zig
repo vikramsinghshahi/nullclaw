@@ -1,6 +1,9 @@
 const std = @import("std");
 const types = @import("config_types.zig");
 const agent_routing = @import("agent_routing.zig");
+const secrets = @import("security/secrets.zig");
+
+const log = std.log.scoped(.config);
 
 // Forward-reference to the Config struct defined in config.zig.
 // Zig handles circular @import lazily, so this works as long as there is
@@ -20,15 +23,56 @@ pub fn parseStringArray(allocator: std.mem.Allocator, arr: std.json.Array) ![]co
     return try list.toOwnedSlice(allocator);
 }
 
-fn parseApiKeyField(allocator: std.mem.Allocator, value: std.json.Value) !?[]const u8 {
+fn decryptSecretField(allocator: std.mem.Allocator, config_path: []const u8, value: []const u8) ![]u8 {
+    const config_dir = std.fs.path.dirname(config_path) orelse ".";
+    const store = secrets.SecretStore.init(config_dir, true);
+    return try store.decryptSecret(allocator, value);
+}
+
+fn decryptSecretArray(
+    allocator: std.mem.Allocator,
+    config_path: []const u8,
+    arr: std.json.Array,
+) ![]const []const u8 {
+    var list: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer {
+        for (list.items) |item| allocator.free(item);
+        list.deinit(allocator);
+    }
+
+    try list.ensureTotalCapacity(allocator, @intCast(arr.items.len));
+    for (arr.items) |item| {
+        if (item == .string) {
+            try list.append(allocator, try decryptSecretField(allocator, config_path, item.string));
+        }
+    }
+    return try list.toOwnedSlice(allocator);
+}
+
+fn parseApiKeyField(cfg: *const Config, value: std.json.Value) !?[]const u8 {
     return switch (value) {
-        .string => |s| try allocator.dupe(u8, s),
-        .object, .array => try std.json.Stringify.valueAlloc(allocator, value, .{}),
+        .string => |s| try decryptSecretField(cfg.allocator, cfg.config_path, s),
+        .object, .array => try std.json.Stringify.valueAlloc(cfg.allocator, value, .{}),
         else => null,
     };
 }
 
-fn splitPrimaryModelRef(primary: []const u8) ?struct { provider: []const u8, model: []const u8 } {
+const PrimaryModelRef = struct {
+    provider: []const u8,
+    model: []const u8,
+};
+
+fn freeNamedAgentConfig(allocator: std.mem.Allocator, agent_cfg: *types.NamedAgentConfig) void {
+    allocator.free(agent_cfg.name);
+    allocator.free(agent_cfg.provider);
+    allocator.free(agent_cfg.model);
+    if (agent_cfg.system_prompt) |system_prompt| allocator.free(system_prompt);
+    if (agent_cfg.system_prompt_path) |system_prompt_path| allocator.free(system_prompt_path);
+    if (agent_cfg.workspace_path) |workspace_path| allocator.free(workspace_path);
+    if (agent_cfg.api_key) |api_key| allocator.free(api_key);
+}
+
+fn splitPrimaryModelRef(primary: []const u8) ?PrimaryModelRef {
     // Handle custom: prefix specially (e.g., "custom:https://example.com/v2/model")
     if (std.mem.startsWith(u8, primary, "custom:")) {
         // The format is "custom:<provider_url>/<model>" where <provider_url> may contain slashes.
@@ -67,11 +111,186 @@ fn splitPrimaryModelRef(primary: []const u8) ?struct { provider: []const u8, mod
     };
 }
 
+fn parseDiagnosticsOtelHeaders(
+    allocator: std.mem.Allocator,
+    value: std.json.Value,
+) !?[]const types.DiagnosticsConfig.OtelHeaderEntry {
+    if (value != .object) return null;
+
+    var header_list: std.ArrayListUnmanaged(types.DiagnosticsConfig.OtelHeaderEntry) = .empty;
+    errdefer {
+        for (header_list.items) |header| {
+            allocator.free(header.key);
+            allocator.free(header.value);
+        }
+        header_list.deinit(allocator);
+    }
+
+    var hit = value.object.iterator();
+    while (hit.next()) |he| {
+        if (he.value_ptr.* != .string) continue;
+
+        const header_key = try allocator.dupe(u8, he.key_ptr.*);
+        const header_value = try allocator.dupe(u8, he.value_ptr.string);
+        header_list.append(allocator, .{
+            .key = header_key,
+            .value = header_value,
+        }) catch |err| {
+            allocator.free(header_key);
+            allocator.free(header_value);
+            return err;
+        };
+    }
+
+    return try header_list.toOwnedSlice(allocator);
+}
+
+fn parseNamedAgentObject(
+    allocator: std.mem.Allocator,
+    config_path: []const u8,
+    agent_name: []const u8,
+    item: std.json.Value,
+) !?types.NamedAgentConfig {
+    if (item != .object) return null;
+
+    const provider_val = item.object.get("provider");
+    const resolved_ref: ?PrimaryModelRef = blk: {
+        const m = item.object.get("model") orelse break :blk null;
+        if (provider_val) |pv| {
+            if (pv != .string) break :blk null;
+            if (m == .string) {
+                break :blk .{
+                    .provider = pv.string,
+                    .model = m.string,
+                };
+            }
+            if (m == .object) {
+                if (m.object.get("primary")) |mp| {
+                    if (mp == .string) {
+                        break :blk .{
+                            .provider = pv.string,
+                            .model = mp.string,
+                        };
+                    }
+                }
+            }
+            break :blk null;
+        }
+
+        if (m == .string) {
+            if (splitPrimaryModelRef(m.string)) |parsed_ref| {
+                break :blk parsed_ref;
+            }
+            break :blk null;
+        }
+        if (m == .object) {
+            if (m.object.get("primary")) |mp| {
+                if (mp == .string) {
+                    if (splitPrimaryModelRef(mp.string)) |parsed_ref| {
+                        break :blk parsed_ref;
+                    }
+                }
+            }
+        }
+        break :blk null;
+    };
+    if (resolved_ref == null) return null;
+
+    var agent_cfg = types.NamedAgentConfig{
+        .name = try allocator.dupe(u8, agent_name),
+        .provider = try allocator.dupe(u8, resolved_ref.?.provider),
+        .model = try allocator.dupe(u8, resolved_ref.?.model),
+    };
+    errdefer freeNamedAgentConfig(allocator, &agent_cfg);
+    if (item.object.get("system_prompt")) |sp| {
+        if (sp == .string) {
+            const val = sp.string;
+            if (std.fs.path.isAbsolute(val) and std.mem.indexOfScalar(u8, val, '\n') == null) {
+                const file_content = blk: {
+                    const file = std.fs.openFileAbsolute(val, .{}) catch |err| {
+                        std.log.warn("system_prompt looks like a file path but failed to open '{s}': {s}", .{ val, @errorName(err) });
+                        break :blk null;
+                    };
+                    defer file.close();
+                    break :blk file.readToEndAlloc(allocator, 64 * 1024) catch |err| {
+                        std.log.warn("system_prompt failed to read file '{s}': {s}", .{ val, @errorName(err) });
+                        break :blk null;
+                    };
+                };
+                if (file_content) |content| {
+                    agent_cfg.system_prompt = content;
+                    agent_cfg.system_prompt_path = try allocator.dupe(u8, val);
+                } else {
+                    agent_cfg.system_prompt = try allocator.dupe(u8, val);
+                }
+            } else {
+                agent_cfg.system_prompt = try allocator.dupe(u8, val);
+            }
+        }
+    }
+    if (item.object.get("api_key")) |ak| {
+        if (ak == .string) agent_cfg.api_key = try decryptSecretField(allocator, config_path, ak.string);
+    }
+    if (item.object.get("workspace_path")) |wp| {
+        if (wp == .string) agent_cfg.workspace_path = try allocator.dupe(u8, wp.string);
+    }
+    if (item.object.get("temperature")) |t| {
+        if (t == .float) agent_cfg.temperature = t.float;
+        if (t == .integer) agent_cfg.temperature = @floatFromInt(t.integer);
+    }
+    if (item.object.get("max_depth")) |md| {
+        if (md == .integer) agent_cfg.max_depth = @intCast(md.integer);
+    }
+    return agent_cfg;
+}
+
 fn parsePeerKind(kind: []const u8) ?agent_routing.ChatType {
     if (std.mem.eql(u8, kind, "direct") or std.mem.eql(u8, kind, "dm")) return .direct;
     if (std.mem.eql(u8, kind, "group")) return .group;
     if (std.mem.eql(u8, kind, "channel")) return .channel;
     return null;
+}
+
+fn parseModelRouteCostClass(raw: []const u8) ?types.ModelRouteCostClass {
+    if (std.ascii.eqlIgnoreCase(raw, "free")) return .free;
+    if (std.ascii.eqlIgnoreCase(raw, "cheap")) return .cheap;
+    if (std.ascii.eqlIgnoreCase(raw, "standard")) return .standard;
+    if (std.ascii.eqlIgnoreCase(raw, "premium")) return .premium;
+    return null;
+}
+
+fn parseModelRouteQuotaClass(raw: []const u8) ?types.ModelRouteQuotaClass {
+    if (std.ascii.eqlIgnoreCase(raw, "unlimited")) return .unlimited;
+    if (std.ascii.eqlIgnoreCase(raw, "normal")) return .normal;
+    if (std.ascii.eqlIgnoreCase(raw, "constrained")) return .constrained;
+    return null;
+}
+
+fn freeModelRouteConfig(allocator: std.mem.Allocator, route: types.ModelRouteConfig) void {
+    allocator.free(route.hint);
+    allocator.free(route.provider);
+    allocator.free(route.model);
+    if (route.api_key) |api_key| allocator.free(api_key);
+}
+
+/// Normalize a peer ID from config: convert legacy `#topic:N` format to
+/// canonical `:thread:N` format used internally for route matching.
+/// Logs a deprecation warning when conversion occurs.
+fn normalizePeerId(allocator: std.mem.Allocator, raw_id: []const u8) ![]u8 {
+    const legacy_sep = "#topic:";
+    if (std.mem.indexOf(u8, raw_id, legacy_sep)) |sep_pos| {
+        const chat_id = raw_id[0..sep_pos];
+        const thread_part = raw_id[sep_pos + legacy_sep.len ..];
+        if (chat_id.len > 0 and thread_part.len > 0) {
+            log.warn(
+                "binding peer id \"{s}\" uses deprecated #topic: format — " ++
+                    "please update config.json to use \":thread:\" instead (e.g. \"{s}:thread:{s}\")",
+                .{ raw_id, chat_id, thread_part },
+            );
+            return std.fmt.allocPrint(allocator, "{s}:thread:{s}", .{ chat_id, thread_part });
+        }
+    }
+    return allocator.dupe(u8, raw_id);
 }
 
 fn parseAgentBindingsArray(
@@ -123,7 +342,7 @@ fn parseAgentBindingsArray(
                             if (parsePeerKind(kind_val.?.string)) |kind| {
                                 binding.match.peer = .{
                                     .kind = kind,
-                                    .id = try allocator.dupe(u8, id_val.?.string),
+                                    .id = try normalizePeerId(allocator, id_val.?.string),
                                 };
                             }
                         }
@@ -161,7 +380,7 @@ fn getPreferredAccount(channel_obj: std.json.ObjectMap) ?SelectedAccount {
     if (accounts.get("default")) |default_acc| {
         if (default_acc == .object) {
             if (has_multiple) {
-                std.log.warn("Multiple accounts configured; using accounts.default", .{});
+                log.warn("Multiple accounts configured; using accounts.default", .{});
             }
             return .{ .id = "default", .value = default_acc };
         }
@@ -169,7 +388,7 @@ fn getPreferredAccount(channel_obj: std.json.ObjectMap) ?SelectedAccount {
     if (accounts.get("main")) |main_acc| {
         if (main_acc == .object) {
             if (has_multiple) {
-                std.log.warn("Multiple accounts configured; using accounts.main", .{});
+                log.warn("Multiple accounts configured; using accounts.main", .{});
             }
             return .{ .id = "main", .value = main_acc };
         }
@@ -179,7 +398,7 @@ fn getPreferredAccount(channel_obj: std.json.ObjectMap) ?SelectedAccount {
     const first = it.next() orelse return null;
     if (first.value_ptr.* != .object) return null;
     if (has_multiple) {
-        std.log.warn("Multiple accounts configured; only first account used", .{});
+        log.warn("Multiple accounts configured; only first account used", .{});
     }
     return .{
         .id = first.key_ptr.*,
@@ -257,6 +476,123 @@ fn parseMultiAccountChannel(comptime T: type, allocator: std.mem.Allocator, chan
     return try list.toOwnedSlice(allocator);
 }
 
+fn parseExternalEnv(
+    allocator: std.mem.Allocator,
+    value: std.json.Value,
+) ![]const types.ExternalChannelConfig.EnvEntry {
+    if (value != .object) return &.{};
+
+    var entries: std.ArrayListUnmanaged(types.ExternalChannelConfig.EnvEntry) = .empty;
+    var it = value.object.iterator();
+    while (it.next()) |entry| {
+        if (entry.value_ptr.* != .string) continue;
+        try entries.append(allocator, .{
+            .key = try allocator.dupe(u8, entry.key_ptr.*),
+            .value = try allocator.dupe(u8, entry.value_ptr.string),
+        });
+    }
+
+    if (entries.items.len > 1) {
+        std.mem.sort(types.ExternalChannelConfig.EnvEntry, entries.items, {}, struct {
+            fn cmp(_: void, a: types.ExternalChannelConfig.EnvEntry, b: types.ExternalChannelConfig.EnvEntry) bool {
+                return std.mem.order(u8, a.key, b.key) == .lt;
+            }
+        }.cmp);
+    }
+
+    return try entries.toOwnedSlice(allocator);
+}
+
+fn parseExternalTransportConfig(
+    allocator: std.mem.Allocator,
+    value: std.json.Value,
+) !types.ExternalChannelConfig.TransportConfig {
+    var transport = types.ExternalChannelConfig.TransportConfig{};
+    if (value != .object) return transport;
+
+    const obj = value.object;
+    if (obj.get("command")) |command_value| {
+        if (command_value == .string) {
+            transport.command = try allocator.dupe(u8, command_value.string);
+        }
+    }
+    if (obj.get("args")) |args_value| {
+        if (args_value == .array) {
+            transport.args = try parseStringArray(allocator, args_value.array);
+        }
+    }
+    if (obj.get("env")) |env_value| {
+        transport.env = try parseExternalEnv(allocator, env_value);
+    }
+    if (obj.get("timeout_ms")) |timeout_value| {
+        if (timeout_value == .integer) {
+            if (timeout_value.integer >= 0 and timeout_value.integer <= std.math.maxInt(u32)) {
+                transport.timeout_ms = @intCast(timeout_value.integer);
+            } else {
+                transport.timeout_ms = 0;
+            }
+        } else {
+            transport.timeout_ms = 0;
+        }
+    }
+
+    return transport;
+}
+
+fn parseExternalChannelAccount(
+    self: *Config,
+    account_id: []const u8,
+    value: std.json.Value,
+) !?types.ExternalChannelConfig {
+    if (value != .object) return null;
+
+    const obj = value.object;
+
+    var parsed = types.ExternalChannelConfig{
+        .account_id = try self.allocator.dupe(u8, account_id),
+    };
+
+    if (obj.get("runtime_name")) |runtime_name_value| {
+        if (runtime_name_value == .string) {
+            parsed.runtime_name = try self.allocator.dupe(u8, runtime_name_value.string);
+        }
+    }
+    if (obj.get("transport")) |transport_value| {
+        parsed.transport = try parseExternalTransportConfig(self.allocator, transport_value);
+    }
+    if (obj.get("config")) |config_value| {
+        parsed.plugin_config_json = try std.json.Stringify.valueAlloc(self.allocator, config_value, .{});
+    } else {
+        parsed.plugin_config_json = try self.allocator.dupe(u8, parsed.plugin_config_json);
+    }
+
+    return parsed;
+}
+
+fn parseExternalChannels(self: *Config, channel_value: std.json.Value) ![]const types.ExternalChannelConfig {
+    if (channel_value != .object) return &.{};
+
+    const accounts = try getAllAccountsSorted(self.allocator, channel_value.object);
+    defer if (accounts.len > 0) self.allocator.free(accounts);
+
+    var list: std.ArrayListUnmanaged(types.ExternalChannelConfig) = .empty;
+
+    if (accounts.len == 0) {
+        if (try parseExternalChannelAccount(self, "default", channel_value)) |parsed| {
+            try list.append(self.allocator, parsed);
+        }
+        return if (list.items.len == 0) &.{} else try list.toOwnedSlice(self.allocator);
+    }
+
+    for (accounts) |account| {
+        if (try parseExternalChannelAccount(self, account.id, account.value)) |parsed| {
+            try list.append(self.allocator, parsed);
+        }
+    }
+
+    return if (list.items.len == 0) &.{} else try list.toOwnedSlice(self.allocator);
+}
+
 fn parseSingleAccountChannel(comptime T: type, allocator: std.mem.Allocator, channel_value: std.json.Value) !?T {
     if (channel_value != .object) return null;
     const selected = getPreferredAccount(channel_value.object) orelse return null;
@@ -281,39 +617,48 @@ fn parseChannels(self: *Config, channels_value: std.json.Value) !void {
 
     inline for (std.meta.fields(types.ChannelsConfig)) |field| {
         if (comptime std.mem.eql(u8, field.name, "cli")) continue;
-        if (channels_obj.get(field.name)) |channel_value| {
-            switch (@typeInfo(field.type)) {
-                .pointer => |ptr| {
-                    if (ptr.size == .slice) {
-                        const Elem = ptr.child;
-                        const parsed = try parseMultiAccountChannel(Elem, self.allocator, channel_value);
-                        if (parsed.len > 0) {
-                            @field(self.channels, field.name) = parsed;
+        if (comptime std.mem.eql(u8, field.name, "external")) {
+            if (channels_obj.get(field.name)) |channel_value| {
+                const parsed = try parseExternalChannels(self, channel_value);
+                if (parsed.len > 0) {
+                    self.channels.external = parsed;
+                }
+            }
+        } else {
+            if (channels_obj.get(field.name)) |channel_value| {
+                switch (@typeInfo(field.type)) {
+                    .pointer => |ptr| {
+                        if (ptr.size == .slice) {
+                            const Elem = ptr.child;
+                            const parsed = try parseMultiAccountChannel(Elem, self.allocator, channel_value);
+                            if (parsed.len > 0) {
+                                @field(self.channels, field.name) = parsed;
+                            }
                         }
-                    }
-                },
-                .optional => |opt| {
-                    const Child = opt.child;
-                    const info = @typeInfo(Child);
-                    if (info == .pointer and info.pointer.size == .one) {
-                        // ?*T — heap-allocated single config (e.g. NostrConfig)
-                        const Pointee = info.pointer.child;
-                        if (parseInlineChannel(Pointee, self.allocator, channel_value)) |parsed| {
-                            const ptr = try self.allocator.create(Pointee);
-                            ptr.* = parsed;
-                            @field(self.channels, field.name) = ptr;
+                    },
+                    .optional => |opt| {
+                        const Child = opt.child;
+                        const info = @typeInfo(Child);
+                        if (info == .pointer and info.pointer.size == .one) {
+                            // ?*T — heap-allocated single config (e.g. NostrConfig)
+                            const Pointee = info.pointer.child;
+                            if (parseInlineChannel(Pointee, self.allocator, channel_value)) |parsed| {
+                                const ptr = try self.allocator.create(Pointee);
+                                ptr.* = parsed;
+                                @field(self.channels, field.name) = ptr;
+                            }
+                        } else if (comptime @hasField(Child, "account_id")) {
+                            if (try parseSingleAccountChannel(Child, self.allocator, channel_value)) |parsed| {
+                                @field(self.channels, field.name) = parsed;
+                            }
+                        } else {
+                            if (parseInlineChannel(Child, self.allocator, channel_value)) |parsed| {
+                                @field(self.channels, field.name) = parsed;
+                            }
                         }
-                    } else if (comptime @hasField(Child, "account_id")) {
-                        if (try parseSingleAccountChannel(Child, self.allocator, channel_value)) |parsed| {
-                            @field(self.channels, field.name) = parsed;
-                        }
-                    } else {
-                        if (parseInlineChannel(Child, self.allocator, channel_value)) |parsed| {
-                            @field(self.channels, field.name) = parsed;
-                        }
-                    }
-                },
-                else => {},
+                    },
+                    else => {},
+                }
             }
         }
     }
@@ -368,6 +713,10 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
     if (root.get("model_routes")) |v| {
         if (v == .array) {
             var list: std.ArrayListUnmanaged(types.ModelRouteConfig) = .empty;
+            errdefer {
+                for (list.items) |route| freeModelRouteConfig(self.allocator, route);
+                list.deinit(self.allocator);
+            }
             try list.ensureTotalCapacity(self.allocator, @intCast(v.array.items.len));
             for (v.array.items) |item| {
                 if (item == .object) {
@@ -375,15 +724,40 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                     const provider = item.object.get("provider") orelse continue;
                     const model = item.object.get("model") orelse continue;
                     if (hint != .string or provider != .string or model != .string) continue;
-                    var route = types.ModelRouteConfig{
-                        .hint = try self.allocator.dupe(u8, hint.string),
-                        .provider = try self.allocator.dupe(u8, provider.string),
-                        .model = try self.allocator.dupe(u8, model.string),
-                    };
-                    if (item.object.get("api_key")) |ak| {
-                        if (ak == .string) route.api_key = try self.allocator.dupe(u8, ak.string);
+                    {
+                        const hint_owned = try self.allocator.dupe(u8, hint.string);
+                        errdefer self.allocator.free(hint_owned);
+                        const provider_owned = try self.allocator.dupe(u8, provider.string);
+                        errdefer self.allocator.free(provider_owned);
+                        const model_owned = try self.allocator.dupe(u8, model.string);
+                        errdefer self.allocator.free(model_owned);
+
+                        var route = types.ModelRouteConfig{
+                            .hint = hint_owned,
+                            .provider = provider_owned,
+                            .model = model_owned,
+                        };
+                        errdefer if (route.api_key) |api_key| self.allocator.free(api_key);
+
+                        if (item.object.get("api_key")) |ak| {
+                            if (ak == .string) route.api_key = try decryptSecretField(self.allocator, self.config_path, ak.string);
+                        }
+                        if (item.object.get("cost_class")) |cost_class| {
+                            if (cost_class == .string) {
+                                if (parseModelRouteCostClass(cost_class.string)) |parsed_cost_class| {
+                                    route.cost_class = parsed_cost_class;
+                                }
+                            }
+                        }
+                        if (item.object.get("quota_class")) |quota_class| {
+                            if (quota_class == .string) {
+                                if (parseModelRouteQuotaClass(quota_class.string)) |parsed_quota_class| {
+                                    route.quota_class = parsed_quota_class;
+                                }
+                            }
+                        }
+                        try list.append(self.allocator, route);
                     }
-                    try list.append(self.allocator, route);
                 }
             }
             self.model_routes = try list.toOwnedSlice(self.allocator);
@@ -457,50 +831,41 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (agents_val.object.get("list")) |list_val| {
                 if (list_val == .array) {
                     var list: std.ArrayListUnmanaged(types.NamedAgentConfig) = .empty;
+                    errdefer {
+                        for (list.items) |*agent_cfg| freeNamedAgentConfig(self.allocator, agent_cfg);
+                        list.deinit(self.allocator);
+                    }
                     try list.ensureTotalCapacity(self.allocator, @intCast(list_val.array.items.len));
                     for (list_val.array.items) |item| {
                         if (item == .object) {
-                            // "id" or "name" for the agent name
                             const name_val = item.object.get("id") orelse item.object.get("name") orelse continue;
-                            const provider = item.object.get("provider") orelse continue;
-                            if (name_val != .string or provider != .string) continue;
-
-                            // model can be string or {"primary": "..."}
-                            const model_str: ?[]const u8 = blk: {
-                                const m = item.object.get("model") orelse break :blk null;
-                                if (m == .string) break :blk m.string;
-                                if (m == .object) {
-                                    if (m.object.get("primary")) |mp| {
-                                        if (mp == .string) break :blk mp.string;
-                                    }
-                                }
-                                break :blk null;
-                            };
-                            if (model_str == null) continue;
-
-                            var agent_cfg = types.NamedAgentConfig{
-                                .name = try self.allocator.dupe(u8, name_val.string),
-                                .provider = try self.allocator.dupe(u8, provider.string),
-                                .model = try self.allocator.dupe(u8, model_str.?),
-                            };
-                            if (item.object.get("system_prompt")) |sp| {
-                                if (sp == .string) agent_cfg.system_prompt = try self.allocator.dupe(u8, sp.string);
-                            }
-                            if (item.object.get("api_key")) |ak| {
-                                if (ak == .string) agent_cfg.api_key = try self.allocator.dupe(u8, ak.string);
-                            }
-                            if (item.object.get("temperature")) |t| {
-                                if (t == .float) agent_cfg.temperature = t.float;
-                                if (t == .integer) agent_cfg.temperature = @floatFromInt(t.integer);
-                            }
-                            if (item.object.get("max_depth")) |md| {
-                                if (md == .integer) agent_cfg.max_depth = @intCast(md.integer);
-                            }
+                            if (name_val != .string) continue;
+                            var agent_cfg = try parseNamedAgentObject(self.allocator, self.config_path, name_val.string, item) orelse continue;
+                            errdefer freeNamedAgentConfig(self.allocator, &agent_cfg);
                             try list.append(self.allocator, agent_cfg);
                         }
                     }
                     self.agents = try list.toOwnedSlice(self.allocator);
                 }
+            }
+
+            // Also accept the object-of-objects shape:
+            // "agents": { "defaults": {...}, "coder": {...}, "researcher": {...} }
+            if (self.agents.len == 0) {
+                var named_agent_list: std.ArrayListUnmanaged(types.NamedAgentConfig) = .empty;
+                errdefer {
+                    for (named_agent_list.items) |*agent_cfg| freeNamedAgentConfig(self.allocator, agent_cfg);
+                    named_agent_list.deinit(self.allocator);
+                }
+                var it = agents_val.object.iterator();
+                while (it.next()) |entry| {
+                    const key = entry.key_ptr.*;
+                    if (std.mem.eql(u8, key, "defaults") or std.mem.eql(u8, key, "list")) continue;
+                    var agent_cfg = try parseNamedAgentObject(self.allocator, self.config_path, key, entry.value_ptr.*) orelse continue;
+                    errdefer freeNamedAgentConfig(self.allocator, &agent_cfg);
+                    try named_agent_list.append(self.allocator, agent_cfg);
+                }
+                self.agents = try named_agent_list.toOwnedSlice(self.allocator);
             }
         }
     }
@@ -522,13 +887,37 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                 const server_name = entry.key_ptr.*;
                 const val = entry.value_ptr.*;
                 if (val != .object) continue;
-                const cmd = val.object.get("command") orelse continue;
-                if (cmd != .string) continue;
+                // `transport` is optional. If omitted, infer it from the presence of `url`.
+                // This keeps the config compatible with MCP READMEs that only specify
+                // {command,args} (stdio) or {url,headers} (http).
+                const transport_val = val.object.get("transport");
+                const transport = if (transport_val) |tv| blk: {
+                    if (tv != .string) continue;
+                    break :blk tv.string;
+                } else if (val.object.get("url") != null)
+                    types.McpServerConfig.HTTP_TRANSPORT
+                else
+                    types.McpServerConfig.DEFAULT_TRANSPORT;
+                const is_http = types.McpServerConfig.isHttpTransport(transport);
+
+                var command: []const u8 = "";
+                if (!is_http) {
+                    const cmd = val.object.get("command") orelse continue;
+                    if (cmd != .string) continue;
+                    command = cmd.string;
+                }
 
                 var mcp_cfg = types.McpServerConfig{
                     .name = try self.allocator.dupe(u8, server_name),
-                    .command = try self.allocator.dupe(u8, cmd.string),
+                    .transport = try self.allocator.dupe(u8, transport),
+                    .command = try self.allocator.dupe(u8, command),
                 };
+
+                if (val.object.get("url")) |url_val| {
+                    if (url_val == .string) {
+                        mcp_cfg.url = try self.allocator.dupe(u8, url_val.string);
+                    }
+                }
 
                 // args: string array
                 if (val.object.get("args")) |a| {
@@ -549,6 +938,29 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                             }
                         }
                         mcp_cfg.env = try env_list.toOwnedSlice(self.allocator);
+                    }
+                }
+
+                // headers: object of string→string
+                if (val.object.get("headers")) |h| {
+                    if (h == .object) {
+                        var header_list: std.ArrayListUnmanaged(types.McpServerConfig.McpHeaderEntry) = .empty;
+                        var hit = h.object.iterator();
+                        while (hit.next()) |he| {
+                            if (he.value_ptr.* == .string) {
+                                try header_list.append(self.allocator, .{
+                                    .key = try self.allocator.dupe(u8, he.key_ptr.*),
+                                    .value = try self.allocator.dupe(u8, he.value_ptr.string),
+                                });
+                            }
+                        }
+                        mcp_cfg.headers = try header_list.toOwnedSlice(self.allocator);
+                    }
+                }
+
+                if (val.object.get("timeout_ms")) |t| {
+                    if (t == .integer and t.integer >= 0 and t.integer <= std.math.maxInt(u32)) {
+                        mcp_cfg.timeout_ms = @intCast(t.integer);
                     }
                 }
 
@@ -599,13 +1011,46 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                     self.diagnostics.token_usage_ledger_max_lines = @intCast(v.integer);
                 }
             }
+            var has_nested_otel_endpoint = false;
+            var has_nested_otel_service_name = false;
+            var has_nested_otel_headers = false;
             if (diag.object.get("otel")) |otel| {
                 if (otel == .object) {
                     if (otel.object.get("endpoint")) |v| {
-                        if (v == .string) self.diagnostics.otel_endpoint = try self.allocator.dupe(u8, v.string);
+                        if (v == .string) {
+                            self.diagnostics.otel_endpoint = try self.allocator.dupe(u8, v.string);
+                            has_nested_otel_endpoint = true;
+                        }
                     }
                     if (otel.object.get("service_name")) |v| {
-                        if (v == .string) self.diagnostics.otel_service_name = try self.allocator.dupe(u8, v.string);
+                        if (v == .string) {
+                            self.diagnostics.otel_service_name = try self.allocator.dupe(u8, v.string);
+                            has_nested_otel_service_name = true;
+                        }
+                    }
+                    if (otel.object.get("headers")) |h| {
+                        if (try parseDiagnosticsOtelHeaders(self.allocator, h)) |headers| {
+                            self.diagnostics.otel_headers = headers;
+                            has_nested_otel_headers = true;
+                        }
+                    }
+                }
+            }
+            // Accept flat OTEL diagnostics aliases as a fallback for older configs.
+            if (!has_nested_otel_endpoint) {
+                if (diag.object.get("otel_endpoint")) |v| {
+                    if (v == .string) self.diagnostics.otel_endpoint = try self.allocator.dupe(u8, v.string);
+                }
+            }
+            if (!has_nested_otel_service_name) {
+                if (diag.object.get("otel_service_name")) |v| {
+                    if (v == .string) self.diagnostics.otel_service_name = try self.allocator.dupe(u8, v.string);
+                }
+            }
+            if (!has_nested_otel_headers) {
+                if (diag.object.get("otel_headers")) |h| {
+                    if (try parseDiagnosticsOtelHeaders(self.allocator, h)) |headers| {
+                        self.diagnostics.otel_headers = headers;
                     }
                 }
             }
@@ -689,7 +1134,7 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                 if (v == .array) self.reliability.fallback_providers = try parseStringArray(self.allocator, v.array);
             }
             if (rel.object.get("api_keys")) |v| {
-                if (v == .array) self.reliability.api_keys = try parseStringArray(self.allocator, v.array);
+                if (v == .array) self.reliability.api_keys = try decryptSecretArray(self.allocator, self.config_path, v.array);
             }
             if (rel.object.get("model_fallbacks")) |v| {
                 if (v == .array) {
@@ -820,6 +1265,15 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (ag.object.get("message_timeout_secs")) |v| {
                 if (v == .integer) self.agent.message_timeout_secs = @intCast(v.integer);
             }
+            if (ag.object.get("timezone")) |v| {
+                if (v == .string) self.agent.timezone = try self.allocator.dupe(u8, v.string);
+            }
+            if (ag.object.get("vision_disabled_models")) |v| {
+                if (v == .array) self.agent.vision_disabled_models = try parseStringArray(self.allocator, v.array);
+            }
+            if (ag.object.get("auto_disable_vision_on_error")) |v| {
+                if (v == .bool) self.agent.auto_disable_vision_on_error = v.bool;
+            }
             // tool_filter_groups: array of { mode, tools, keywords? }
             if (ag.object.get("tool_filter_groups")) |fg_val| {
                 if (fg_val == .array) {
@@ -866,6 +1320,9 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             }
             if (tl.object.get("web_fetch_max_chars")) |v| {
                 if (v == .integer) self.tools.web_fetch_max_chars = @intCast(v.integer);
+            }
+            if (tl.object.get("path_env_vars")) |v| {
+                if (v == .array) self.tools.path_env_vars = try parseStringArray(self.allocator, v.array);
             }
             // tools.media.audio → self.audio_media
             if (tl.object.get("media")) |media| {
@@ -962,7 +1419,7 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                                 self.memory.search.store.qdrant_collection = try self.allocator.dupe(u8, v.string);
                             };
                             if (store.get("qdrant_api_key")) |v| if (v == .string) {
-                                self.memory.search.store.qdrant_api_key = try self.allocator.dupe(u8, v.string);
+                                self.memory.search.store.qdrant_api_key = try decryptSecretField(self.allocator, self.config_path, v.string);
                             };
                             if (store.get("pgvector_table")) |v| if (v == .string) {
                                 self.memory.search.store.pgvector_table = try self.allocator.dupe(u8, v.string);
@@ -1352,7 +1809,7 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                         self.memory.api.url = try self.allocator.dupe(u8, v.string);
                     };
                     if (api.get("api_key")) |v| if (v == .string) {
-                        self.memory.api.api_key = try self.allocator.dupe(u8, v.string);
+                        self.memory.api.api_key = try decryptSecretField(self.allocator, self.config_path, v.string);
                     };
                     if (api.get("timeout_ms")) |v| if (v == .integer) {
                         self.memory.api.timeout_ms = @intCast(v.integer);
@@ -1469,6 +1926,27 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
         }
     }
 
+    // A2A (Agent-to-Agent protocol)
+    if (root.get("a2a")) |a2a| {
+        if (a2a == .object) {
+            if (a2a.object.get("enabled")) |v| {
+                if (v == .bool) self.a2a.enabled = v.bool;
+            }
+            if (a2a.object.get("name")) |v| {
+                if (v == .string) self.a2a.name = try self.allocator.dupe(u8, v.string);
+            }
+            if (a2a.object.get("description")) |v| {
+                if (v == .string) self.a2a.description = try self.allocator.dupe(u8, v.string);
+            }
+            if (a2a.object.get("url")) |v| {
+                if (v == .string) self.a2a.url = try self.allocator.dupe(u8, v.string);
+            }
+            if (a2a.object.get("version")) |v| {
+                if (v == .string) self.a2a.version = try self.allocator.dupe(u8, v.string);
+            }
+        }
+    }
+
     // Identity
     if (root.get("identity")) |id| {
         if (id == .object) {
@@ -1491,7 +1969,7 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                 if (v == .bool) self.composio.enabled = v.bool;
             }
             if (comp.object.get("api_key")) |v| {
-                if (v == .string) self.composio.api_key = try self.allocator.dupe(u8, v.string);
+                if (v == .string) self.composio.api_key = try decryptSecretField(self.allocator, self.config_path, v.string);
             }
             if (comp.object.get("entity_id")) |v| {
                 if (v == .string) self.composio.entity_id = try self.allocator.dupe(u8, v.string);
@@ -1688,6 +2166,58 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (tun.object.get("provider")) |v| {
                 if (v == .string) self.tunnel.provider = try self.allocator.dupe(u8, v.string);
             }
+            // cloudflare sub-config
+            if (tun.object.get("cloudflare")) |cf| {
+                if (cf == .object) {
+                    var cf_cfg = types.CloudflareTunnelConfig{};
+                    if (cf.object.get("token")) |tok| {
+                        if (tok == .string) cf_cfg.token = try self.allocator.dupe(u8, tok.string);
+                    }
+                    self.tunnel.cloudflare = cf_cfg;
+                }
+            }
+            // ngrok sub-config
+            if (tun.object.get("ngrok")) |ng| {
+                if (ng == .object) {
+                    var ng_cfg = types.NgrokTunnelConfig{};
+                    if (ng.object.get("auth_token")) |tok| {
+                        if (tok == .string) ng_cfg.auth_token = try self.allocator.dupe(u8, tok.string);
+                    }
+                    if (ng.object.get("domain")) |dom| {
+                        if (dom == .string) ng_cfg.domain = try self.allocator.dupe(u8, dom.string);
+                    }
+                    self.tunnel.ngrok = ng_cfg;
+                }
+            }
+            // tailscale sub-config
+            if (tun.object.get("tailscale")) |ts| {
+                if (ts == .object) {
+                    var ts_cfg = types.TailscaleTunnelConfig{};
+                    if (ts.object.get("funnel")) |fnl| {
+                        if (fnl == .bool) ts_cfg.funnel = fnl.bool;
+                    }
+                    if (ts.object.get("hostname")) |hn| {
+                        if (hn == .string) ts_cfg.hostname = try self.allocator.dupe(u8, hn.string);
+                    }
+                    self.tunnel.tailscale = ts_cfg;
+                }
+            }
+            // custom sub-config
+            if (tun.object.get("custom")) |cst| {
+                if (cst == .object) {
+                    var cst_cfg = types.CustomTunnelConfig{};
+                    if (cst.object.get("start_command")) |cmd| {
+                        if (cmd == .string) cst_cfg.start_command = try self.allocator.dupe(u8, cmd.string);
+                    }
+                    if (cst.object.get("health_url")) |hu| {
+                        if (hu == .string) cst_cfg.health_url = try self.allocator.dupe(u8, hu.string);
+                    }
+                    if (cst.object.get("url_pattern")) |up| {
+                        if (up == .string) cst_cfg.url_pattern = try self.allocator.dupe(u8, up.string);
+                    }
+                    self.tunnel.custom = cst_cfg;
+                }
+            }
         }
     }
 
@@ -1706,7 +2236,7 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                             .name = try self.allocator.dupe(u8, prov_name),
                         };
                         if (val.object.get("api_key")) |ak| {
-                            pe.api_key = try parseApiKeyField(self.allocator, ak);
+                            pe.api_key = try parseApiKeyField(self, ak);
                         }
                         if (val.object.get("base_url")) |ab| {
                             if (ab == .string) pe.base_url = try self.allocator.dupe(u8, ab.string);
@@ -1722,6 +2252,12 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                         }
                         if (val.object.get("user_agent")) |ua| {
                             if (ua == .string) pe.user_agent = try self.allocator.dupe(u8, ua.string);
+                        }
+                        if (val.object.get("api_mode")) |am| {
+                            if (am == .string) pe.api_mode = types.ProviderEntry.ApiMode.parse(am.string);
+                        }
+                        if (val.object.get("max_streaming_prompt_bytes")) |mb| {
+                            if (mb == .integer and mb.integer >= 0) pe.max_streaming_prompt_bytes = @intCast(mb.integer);
                         }
                         try prov_list.append(self.allocator, pe);
                     }
@@ -1801,6 +2337,91 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                 }
                 self.session.identity_links = try link_list.toOwnedSlice(self.allocator);
             }
+            if (sess.object.get("auto_provision_direct_agents")) |v| {
+                if (v == .bool) self.session.auto_provision_direct_agents = v.bool;
+            }
+            if (sess.object.get("claim_secret")) |v| {
+                if (v == .string and v.string.len > 0) {
+                    self.session.claim_secret = try self.allocator.dupe(u8, v.string);
+                }
+            }
+            if (sess.object.get("claim_admin_secret")) |v| {
+                if (v == .string and v.string.len > 0) {
+                    self.session.claim_admin_secret = try self.allocator.dupe(u8, v.string);
+                }
+            }
+            if (sess.object.get("claim_max_attempts")) |v| {
+                if (v == .integer and v.integer > 0) self.session.claim_max_attempts = @intCast(v.integer);
+            }
+            if (sess.object.get("claim_lockout_secs")) |v| {
+                if (v == .integer and v.integer > 0) self.session.claim_lockout_secs = @intCast(v.integer);
+            }
         }
     }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Tests
+// ════════════════════════════════════════════════════════════════════════════
+
+test "normalizePeerId converts legacy #topic: format to canonical :thread: format" {
+    const allocator = std.testing.allocator;
+
+    // Legacy #topic: format should be converted
+    const converted = try normalizePeerId(allocator, "-1009999999999#topic:4");
+    defer allocator.free(converted);
+    try std.testing.expectEqualStrings("-1009999999999:thread:4", converted);
+
+    // Canonical :thread: format should pass through unchanged
+    const canonical = try normalizePeerId(allocator, "-1009999999999:thread:4");
+    defer allocator.free(canonical);
+    try std.testing.expectEqualStrings("-1009999999999:thread:4", canonical);
+
+    // Plain peer ID without topic should pass through unchanged
+    const plain = try normalizePeerId(allocator, "-1009999999999");
+    defer allocator.free(plain);
+    try std.testing.expectEqualStrings("-1009999999999", plain);
+
+    // Direct chat ID should pass through unchanged
+    const direct = try normalizePeerId(allocator, "5555555555");
+    defer allocator.free(direct);
+    try std.testing.expectEqualStrings("5555555555", direct);
+}
+
+test "parseAgentBindingsArray normalizes legacy #topic: peer IDs" {
+    const allocator = std.testing.allocator;
+
+    const json_str =
+        \\[{
+        \\  "agent_id": "coder",
+        \\  "match": {
+        \\    "channel": "telegram",
+        \\    "account_id": "main",
+        \\    "peer": {
+        \\      "kind": "group",
+        \\      "id": "-1009999999999#topic:4"
+        \\    }
+        \\  }
+        \\}]
+    ;
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_str, .{});
+    defer parsed.deinit();
+
+    const bindings = try parseAgentBindingsArray(allocator, parsed.value.array);
+    defer {
+        for (bindings) |b| {
+            allocator.free(b.agent_id);
+            if (b.match.channel) |ch| allocator.free(ch);
+            if (b.match.account_id) |aid| allocator.free(aid);
+            if (b.match.peer) |p| allocator.free(p.id);
+        }
+        allocator.free(bindings);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), bindings.len);
+    try std.testing.expectEqualStrings("coder", bindings[0].agent_id);
+    try std.testing.expect(bindings[0].match.peer != null);
+    // The legacy #topic:4 format must be normalized to :thread:4
+    try std.testing.expectEqualStrings("-1009999999999:thread:4", bindings[0].match.peer.?.id);
 }

@@ -49,10 +49,14 @@ nullclaw gateway
 | `nullclaw channel start telegram` | 启动指定渠道 |
 | `nullclaw migrate openclaw --dry-run` | 预演迁移 OpenClaw 数据 |
 | `nullclaw migrate openclaw` | 执行迁移 |
+| `nullclaw history list [--limit N] [--offset N] [--json]` | 列出会话记录 |
+| `nullclaw history show <session_id> [--limit N] [--offset N] [--json]` | 查看指定会话的消息详情 |
 
 ## 服务化运行建议
 
 建议在长期运行场景使用 service 子命令：
+
+- Linux 环境会优先使用 `systemd --user`，在 Alpine / OpenRC 系统上会自动切换为 OpenRC。
 
 ```bash
 nullclaw service install
@@ -116,6 +120,8 @@ nullclaw onboard --interactive
 - `channels.<name>.accounts.*` 的 token / webhook / account 字段是否正确。
 - `allow_from` 是否误设为空数组。
 - `nullclaw channel status` 是否有 unhealthy 标记。
+- 如果是 DingTalk，进一步看
+  [DingTalk 运维就绪](./ops/dingtalk-ops-readiness.md)。
 
 ### 4) 网关启动但外部不可访问
 
@@ -124,6 +130,34 @@ nullclaw onboard --interactive
 - 仍绑定在 `127.0.0.1`。
 - 未配置 tunnel 或反向代理。
 - 防火墙未放行端口。
+
+### 5) provider 返回 429 / “rate limit exceeded”
+
+常见原因：
+
+- 额度较低的 coding plan 往往扛不住 tool-heavy 的 agent 回合，即使普通聊天还看起来能用。
+- 当前 provider 计划对重试频率很敏感。
+- 主 provider 被限流后，没有配置可切换的 fallback。
+
+建议排查：
+
+- 前台运行时先用 `nullclaw agent --verbose`。
+- service 模式下查看 `~/.nullclaw/logs/daemon.stdout.log` 与 `~/.nullclaw/logs/daemon.stderr.log`。
+- 跑一次 `nullclaw status`，确认当前实际使用的 provider / model。
+
+如果 plan 本身可用但限流很严，建议保守调整 reliability：
+
+```json
+{
+  "reliability": {
+    "provider_retries": 1,
+    "provider_backoff_ms": 3000,
+    "fallback_providers": ["openrouter"]
+  }
+}
+```
+
+如果同一 provider 有多把 key，可以配置 `reliability.api_keys` 让 NullClaw 在限流时轮转。
 
 ## 变更后回归检查清单
 

@@ -1,14 +1,18 @@
 const std = @import("std");
+const log = std.log.scoped(.gemini);
+const fs_compat = @import("../fs_compat.zig");
 const platform = @import("../platform.zig");
 const root = @import("root.zig");
 const error_classify = @import("error_classify.zig");
 const config_types = @import("../config_types.zig");
 const http_util = @import("../http_util.zig");
+const sse = @import("sse.zig");
 
 const Provider = root.Provider;
 const ChatRequest = root.ChatRequest;
 const ChatResponse = root.ChatResponse;
 const OAUTH_REFRESH_TIMEOUT_SECS: u64 = 20;
+const STREAMING_FALLBACK_TIMEOUT_SECS: u64 = 90;
 
 fn parseExpiresIn(v: std.json.Value) ?i64 {
     return switch (v) {
@@ -45,6 +49,31 @@ fn normalizeTokenUsage(usage: *root.TokenUsage) void {
     if (usage.completion_tokens == 0 and usage.total_tokens > usage.prompt_tokens) {
         usage.completion_tokens = usage.total_tokens - usage.prompt_tokens;
     }
+}
+
+fn finalizeGeminiStreamResult(
+    allocator: std.mem.Allocator,
+    accumulated: []const u8,
+    stream_usage: root.TokenUsage,
+) !root.StreamChatResult {
+    var usage = stream_usage;
+    const content = if (accumulated.len > 0)
+        try allocator.dupe(u8, accumulated)
+    else
+        null;
+
+    if (usage.prompt_tokens == 0 and usage.completion_tokens == 0 and usage.total_tokens == 0) {
+        usage.completion_tokens = @intCast((accumulated.len + 3) / 4);
+        usage.total_tokens = usage.completion_tokens;
+    } else {
+        normalizeTokenUsage(&usage);
+    }
+
+    return .{
+        .content = content,
+        .usage = usage,
+        .model = "",
+    };
 }
 
 fn parseUsageMetadataValue(v: std.json.Value) ?root.TokenUsage {
@@ -726,7 +755,8 @@ pub const GeminiProvider = struct {
 
     /// Run curl in SSE streaming mode for Gemini and parse output line by line.
     ///
-    /// Spawns `curl -s --no-buffer --fail-with-body` and reads stdout incrementally.
+    /// Spawns `curl -s --no-buffer` with the strongest supported fail-fast
+    /// flag: `--fail-with-body` on curl >= 7.76.0, otherwise `-f`.
     /// For each SSE delta, calls `callback(ctx, chunk)`.
     /// Returns accumulated result after stream completes.
     /// Stream ends when curl connection closes (no [DONE] sentinel).
@@ -749,7 +779,7 @@ pub const GeminiProvider = struct {
         argc += 1;
         argv_buf[argc] = "--no-buffer";
         argc += 1;
-        argv_buf[argc] = "--fail-with-body";
+        argv_buf[argc] = sse.curlFailFastArg(allocator);
         argc += 1;
 
         var timeout_buf: [32]u8 = undefined;
@@ -760,6 +790,10 @@ pub const GeminiProvider = struct {
             argv_buf[argc] = timeout_str;
             argc += 1;
         }
+
+        // Match the generic SSE helper: if the stream goes idle for 60 seconds,
+        // let curl fail fast instead of waiting for the full --max-time budget.
+        sse.appendCurlStallDetectionArgs(argv_buf[0..], &argc);
 
         argv_buf[argc] = "-X";
         argc += 1;
@@ -828,8 +862,9 @@ pub const GeminiProvider = struct {
         var stream_usage = root.TokenUsage{};
         const file = child.stdout.?;
         var read_buf: [4096]u8 = undefined;
+        var saw_done = false;
 
-        while (true) {
+        outer: while (true) {
             const n = file.read(&read_buf) catch break;
             if (n == 0) break;
 
@@ -849,7 +884,10 @@ pub const GeminiProvider = struct {
                             try accumulated.appendSlice(allocator, text);
                             callback(ctx, root.StreamChunk.textDelta(text));
                         },
-                        .done => break,
+                        .done => {
+                            saw_done = true;
+                            break :outer;
+                        },
                         .skip => {},
                     }
                 } else {
@@ -859,7 +897,7 @@ pub const GeminiProvider = struct {
         }
 
         // Parse trailing line if stream ended without final newline.
-        if (line_buf.items.len > 0) {
+        if (!saw_done and line_buf.items.len > 0) {
             if (extractGeminiUsageFromSseLine(allocator, line_buf.items) catch null) |usage| {
                 stream_usage = usage;
             }
@@ -884,32 +922,37 @@ pub const GeminiProvider = struct {
             if (n == 0) break;
         }
 
-        const term = child.wait() catch return error.CurlWaitError;
+        const term = child.wait() catch |err| {
+            log.err("curlStreamGemini child.wait failed: {}", .{err});
+            if (root.shouldRecoverPartialStream(accumulated.items.len, saw_done)) {
+                log.warn("curlStreamGemini proceeding despite wait failure after partial stream output", .{});
+                callback(ctx, root.StreamChunk.finalChunk());
+                return finalizeGeminiStreamResult(allocator, accumulated.items, stream_usage);
+            }
+            return error.CurlWaitError;
+        };
         switch (term) {
-            .Exited => |code| if (code != 0) return error.CurlFailed,
-            else => return error.CurlFailed,
+            .Exited => |code| if (code != 0) {
+                if (root.shouldRecoverPartialStream(accumulated.items.len, saw_done)) {
+                    log.warn("curlStreamGemini exit code {d} after partial stream output; returning accumulated output", .{code});
+                    callback(ctx, root.StreamChunk.finalChunk());
+                    return finalizeGeminiStreamResult(allocator, accumulated.items, stream_usage);
+                }
+                return error.CurlFailed;
+            },
+            else => {
+                if (root.shouldRecoverPartialStream(accumulated.items.len, saw_done)) {
+                    log.warn("curlStreamGemini abnormal termination after partial stream output; returning accumulated output", .{});
+                    callback(ctx, root.StreamChunk.finalChunk());
+                    return finalizeGeminiStreamResult(allocator, accumulated.items, stream_usage);
+                }
+                return error.CurlFailed;
+            },
         }
 
         // Signal completion only after successful process exit.
         callback(ctx, root.StreamChunk.finalChunk());
-
-        const content = if (accumulated.items.len > 0)
-            try allocator.dupe(u8, accumulated.items)
-        else
-            null;
-
-        if (stream_usage.prompt_tokens == 0 and stream_usage.completion_tokens == 0 and stream_usage.total_tokens == 0) {
-            stream_usage.completion_tokens = @intCast((accumulated.items.len + 3) / 4);
-            stream_usage.total_tokens = stream_usage.completion_tokens;
-        } else {
-            normalizeTokenUsage(&stream_usage);
-        }
-
-        return .{
-            .content = content,
-            .usage = stream_usage,
-            .model = "",
-        };
+        return finalizeGeminiStreamResult(allocator, accumulated.items, stream_usage);
     }
 
     /// Create a Provider interface from this GeminiProvider.
@@ -1036,14 +1079,32 @@ pub const GeminiProvider = struct {
         const body = try buildChatRequestBody(allocator, request, model, temperature);
         defer allocator.free(body);
 
-        if (auth.isApiKey()) {
-            return curlStreamGemini(allocator, url, body, &.{}, request.timeout_secs, callback, callback_ctx);
-        } else {
+        const stream_result = if (auth.isApiKey())
+            curlStreamGemini(allocator, url, body, &.{}, request.timeout_secs, callback, callback_ctx)
+        else blk: {
             var auth_hdr_buf: [512]u8 = undefined;
             const auth_hdr = std.fmt.bufPrint(&auth_hdr_buf, "Authorization: Bearer {s}", .{auth.credential()}) catch return error.GeminiApiError;
             const headers = [_][]const u8{auth_hdr};
-            return curlStreamGemini(allocator, url, body, &headers, request.timeout_secs, callback, callback_ctx);
+            break :blk curlStreamGemini(allocator, url, body, &headers, request.timeout_secs, callback, callback_ctx);
+        };
+
+        return stream_result catch |err| {
+            if (err == error.CurlWaitError or err == error.CurlFailed) {
+                log.warn("Gemini streaming failed with {}; falling back to non-streaming response", .{err});
+                var fallback_request = request;
+                fallback_request.timeout_secs = streamingFallbackTimeoutSecs(request.timeout_secs);
+                var fallback = try chatImpl(ptr, allocator, fallback_request, model, temperature);
+                return root.emitChatResponseAsStream(allocator, &fallback, callback, callback_ctx);
+            }
+            return err;
+        };
+    }
+
+    pub fn streamingFallbackTimeoutSecs(request_timeout_secs: u64) u64 {
+        if (request_timeout_secs > 0 and request_timeout_secs < STREAMING_FALLBACK_TIMEOUT_SECS) {
+            return request_timeout_secs;
         }
+        return STREAMING_FALLBACK_TIMEOUT_SECS;
     }
 };
 
@@ -1439,6 +1500,14 @@ test "parseGeminiSseLine invalid json returns error" {
         error.InvalidSseJson,
         GeminiProvider.parseGeminiSseLine(std.testing.allocator, "data: not-json"),
     );
+}
+
+test "streamingFallbackTimeoutSecs caps stalled-stream fallback timeout" {
+    // Regression: Gemini/Vertex must not wait the full message_timeout_secs
+    // twice when both the streaming and fallback paths are slow.
+    try std.testing.expectEqual(@as(u64, STREAMING_FALLBACK_TIMEOUT_SECS), GeminiProvider.streamingFallbackTimeoutSecs(0));
+    try std.testing.expectEqual(@as(u64, 45), GeminiProvider.streamingFallbackTimeoutSecs(45));
+    try std.testing.expectEqual(@as(u64, STREAMING_FALLBACK_TIMEOUT_SECS), GeminiProvider.streamingFallbackTimeoutSecs(300));
 }
 
 test "streamChatImpl fails without credentials" {
@@ -1840,7 +1909,7 @@ test "writeCredentialsJson produces valid JSON" {
     try std.testing.expect(obj.get("expires_at").?.integer == 1999999999);
 
     if (@import("builtin").os.tag != .windows and @import("builtin").os.tag != .wasi) {
-        const stat = try file.stat();
+        const stat = try fs_compat.stat(file);
         const mode = stat.mode & 0o777;
         // Respect process umask: require owner rw and forbid executable bits.
         try std.testing.expect((mode & 0o600) == 0o600);

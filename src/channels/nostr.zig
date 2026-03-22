@@ -4,6 +4,7 @@ const root = @import("root.zig");
 const config_types = @import("../config_types.zig");
 const bus = @import("../bus.zig");
 const secrets = @import("../security/secrets.zig");
+const thread_stacks = @import("../thread_stacks.zig");
 
 const log = std.log.scoped(.nostr);
 
@@ -555,7 +556,7 @@ pub const NostrChannel = struct {
     /// Owner is always allowed regardless of the allowlist.
     pub fn isDmAllowed(self: *const NostrChannel, sender_pubkey: []const u8) bool {
         if (std.mem.eql(u8, sender_pubkey, self.config.owner_pubkey)) return true;
-        return root.isAllowedExact(self.config.dm_allowed_pubkeys, sender_pubkey);
+        return root.isAllowedExactScoped("nostr channel", self.config.dm_allowed_pubkeys, sender_pubkey);
     }
 
     /// Record which DM protocol a sender used, for protocol mirroring.
@@ -885,7 +886,7 @@ pub const NostrChannel = struct {
 
         // 4. Spawn the reader thread to process incoming events.
         self.running.store(true, .release);
-        self.reader_thread = std.Thread.spawn(.{ .stack_size = 128 * 1024 }, readerLoop, .{self}) catch {
+        self.reader_thread = std.Thread.spawn(.{ .stack_size = thread_stacks.AUXILIARY_LOOP_STACK_SIZE }, readerLoop, .{self}) catch {
             self.running.store(false, .release);
             return error.ReaderThreadFailed;
         };

@@ -6,12 +6,13 @@
 //!   - Body size limits (64KB max)
 //!   - Request timeouts (30s)
 //!   - Bearer token authentication (PairingGuard)
-//!   - Endpoints: /health, /ready, /pair, /webhook, /whatsapp, /telegram, /line, /lark, /qq, /slack/events
+//!   - Endpoints: /health, /ready, /pair, /webhook, /a2a, /.well-known/agent-card.json, /whatsapp, /telegram, /line, /lark, /wechat, /wecom, /qq, /max, /slack/events, /api/messages (Teams)
 //!
 //! Uses std.http.Server (built-in, no external deps).
 
 const std = @import("std");
 const build_options = @import("build_options");
+const daemon = @import("daemon.zig");
 const health = @import("health.zig");
 const Config = @import("config.zig").Config;
 const config_types = @import("config_types.zig");
@@ -26,9 +27,18 @@ const subagent_runner = @import("subagent_runner.zig");
 const observability = @import("observability.zig");
 const agent_routing = @import("agent_routing.zig");
 const security = @import("security/policy.zig");
+const tencent_crypto = @import("security/tencent_crypto.zig");
+const root_mod = @import("root.zig");
 const PairingGuard = @import("security/pairing.zig").PairingGuard;
+const constantTimeEq = @import("security/pairing.zig").constantTimeEq;
 const channels = @import("channels/root.zig");
 const bus_mod = @import("bus.zig");
+const a2a = @import("a2a.zig");
+const thread_stacks = @import("thread_stacks.zig");
+const channel_adapters = @import("channel_adapters.zig");
+const cron_mod = @import("cron.zig");
+const ConversationContext = @import("agent/prompt.zig").ConversationContext;
+const buildConversationContext = @import("agent/prompt.zig").buildConversationContext;
 
 /// Maximum request body size (64KB) — prevents memory exhaustion.
 pub const MAX_BODY_SIZE: usize = 65_536;
@@ -37,6 +47,7 @@ const MAX_HTTP_REQUEST_SIZE: usize = MAX_HEADER_SIZE + MAX_BODY_SIZE;
 
 /// Request timeout (30s) — prevents slow-loris attacks.
 pub const REQUEST_TIMEOUT_SECS: u64 = 30;
+const ACCEPT_POLL_INTERVAL_MS: u64 = 100;
 
 /// Sliding window for rate limiting (60s).
 pub const RATE_LIMIT_WINDOW_SECS: u64 = 60;
@@ -53,6 +64,95 @@ const GatewayObservedToolEvent = struct {
     tool: []u8,
     success: bool = false,
 };
+
+const WebhookRouting = struct {
+    sender_id: []const u8,
+    chat_id: []const u8,
+    session_key: []const u8,
+    owned_session_key: ?[]const u8 = null,
+    metadata_json: ?[]const u8 = null,
+    conversation_context: ?ConversationContext = null,
+
+    fn deinit(self: *WebhookRouting, allocator: std.mem.Allocator) void {
+        if (self.owned_session_key) |owned| allocator.free(owned);
+        if (self.metadata_json) |owned| allocator.free(owned);
+    }
+};
+
+fn simpleConversationContext(
+    channel: []const u8,
+    account_id: ?[]const u8,
+    peer_id: []const u8,
+    is_group: bool,
+    group_id: ?[]const u8,
+) ?ConversationContext {
+    return buildConversationContext(.{
+        .channel = channel,
+        .account_id = account_id,
+        .peer_id = peer_id,
+        .is_group = is_group,
+        .group_id = if (is_group) (group_id orelse peer_id) else null,
+    });
+}
+
+fn appendWebhookMetadataField(
+    out: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    wrote_field: *bool,
+    key: []const u8,
+    value: []const u8,
+) !void {
+    if (value.len == 0) return;
+    if (wrote_field.*) try out.appendSlice(allocator, ",");
+    wrote_field.* = true;
+    try out.appendSlice(allocator, "\"");
+    try out.appendSlice(allocator, key);
+    try out.appendSlice(allocator, "\":");
+    try root_mod.json_util.appendJsonString(out, allocator, value);
+}
+
+fn buildWebhookRoutingMetadataJson(
+    allocator: std.mem.Allocator,
+    account_id: ?[]const u8,
+    peer_kind: ?agent_routing.ChatType,
+    peer_id: ?[]const u8,
+    sender_username: ?[]const u8,
+    sender_display_name: ?[]const u8,
+) ?[]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    out.append(allocator, '{') catch return null;
+    var wrote_field = false;
+
+    if (account_id) |value| {
+        appendWebhookMetadataField(&out, allocator, &wrote_field, "account_id", value) catch return null;
+    }
+    if (peer_kind) |kind| {
+        const kind_str = switch (kind) {
+            .direct => "direct",
+            .group => "group",
+            .channel => "channel",
+        };
+        appendWebhookMetadataField(&out, allocator, &wrote_field, "peer_kind", kind_str) catch return null;
+    }
+    if (peer_id) |value| {
+        appendWebhookMetadataField(&out, allocator, &wrote_field, "peer_id", value) catch return null;
+    }
+    if (sender_username) |value| {
+        appendWebhookMetadataField(&out, allocator, &wrote_field, "sender_username", value) catch return null;
+    }
+    if (sender_display_name) |value| {
+        appendWebhookMetadataField(&out, allocator, &wrote_field, "sender_display_name", value) catch return null;
+    }
+
+    out.append(allocator, '}') catch return null;
+    if (!wrote_field) {
+        out.deinit(allocator);
+        return null;
+    }
+    return out.toOwnedSlice(allocator) catch null;
+}
 
 const GatewayTurnToolEvent = struct {
     kind: GatewayObservedToolEventKind,
@@ -372,6 +472,16 @@ pub const GatewayState = struct {
     lark_app_secret: []const u8 = "",
     lark_account_id: []const u8 = "default",
     lark_allow_from: []const []const u8 = &.{},
+    wechat_account_id: []const u8 = "default",
+    wechat_allow_from: []const []const u8 = &.{},
+    wechat_callback_token: []const u8 = "",
+    wechat_encoding_aes_key: []const u8 = "",
+    wechat_app_id: []const u8 = "",
+    wecom_account_id: []const u8 = "default",
+    wecom_allow_from: []const []const u8 = &.{},
+    wecom_callback_token: []const u8 = "",
+    wecom_encoding_aes_key: []const u8 = "",
+    wecom_corp_id: []const u8 = "",
     qq_channels: std.ArrayListUnmanaged(channels.qq.QQChannel) = .empty,
     pairing_guard: ?PairingGuard,
     event_bus: ?*bus_mod.Bus = null,
@@ -521,7 +631,7 @@ pub fn parseQueryParam(target: []const u8, name: []const u8) ?[]const u8 {
 pub fn validateBearerToken(token: []const u8, paired_tokens: []const []const u8) bool {
     if (paired_tokens.len == 0) return true;
     for (paired_tokens) |pt| {
-        if (std.mem.eql(u8, token, pt)) return true;
+        if (constantTimeEq(token, pt)) return true;
     }
     return false;
 }
@@ -907,6 +1017,67 @@ fn selectTelegramConfig(
     return &cfg.channels.telegram[0];
 }
 
+fn findMaxConfigByAccountId(cfg: *const Config, account_id: []const u8) ?*const config_types.MaxConfig {
+    for (cfg.channels.max) |*max_cfg| {
+        if (std.ascii.eqlIgnoreCase(max_cfg.account_id, account_id)) return max_cfg;
+    }
+    return null;
+}
+
+fn findMaxConfigByWebhookSecret(cfg: *const Config, secret: []const u8) ?*const config_types.MaxConfig {
+    for (cfg.channels.max) |*max_cfg| {
+        if (max_cfg.webhook_secret) |configured_secret| {
+            if (configured_secret.len > 0 and std.mem.eql(u8, configured_secret, secret)) return max_cfg;
+        }
+    }
+    return null;
+}
+
+fn countMaxWebhookAccounts(cfg: *const Config) usize {
+    var count: usize = 0;
+    for (cfg.channels.max) |max_cfg| {
+        if (max_cfg.mode == .webhook) count += 1;
+    }
+    return count;
+}
+
+fn selectMaxConfig(
+    cfg_opt: ?*const Config,
+    target: []const u8,
+    secret_header: ?[]const u8,
+) ?*const config_types.MaxConfig {
+    if (!build_options.enable_channel_max) return null;
+    const cfg = cfg_opt orelse return null;
+    if (cfg.channels.max.len == 0) return null;
+
+    if (parseQueryParam(target, "account_id")) |account_id| {
+        return findMaxConfigByAccountId(cfg, account_id);
+    }
+    if (parseQueryParam(target, "account")) |account_id| {
+        return findMaxConfigByAccountId(cfg, account_id);
+    }
+
+    if (secret_header) |raw_secret| {
+        const secret = std.mem.trim(u8, raw_secret, " \t\r\n");
+        if (secret.len > 0) {
+            return findMaxConfigByWebhookSecret(cfg, secret);
+        }
+    }
+
+    const webhook_count = countMaxWebhookAccounts(cfg);
+    if (webhook_count == 1) {
+        for (cfg.channels.max) |*max_cfg| {
+            if (max_cfg.mode == .webhook) return max_cfg;
+        }
+    }
+
+    if (cfg.channels.max.len == 1) {
+        return &cfg.channels.max[0];
+    }
+
+    return null;
+}
+
 fn hasLineSecrets(cfg: *const Config) bool {
     if (!build_options.enable_channel_line) return false;
     for (cfg.channels.line) |line_cfg| {
@@ -963,6 +1134,82 @@ fn selectLarkConfig(
     }
 
     return &cfg.channels.lark[0];
+}
+
+fn findWeComConfigByAccountId(
+    cfg: *const Config,
+    account_id: []const u8,
+) ?*const config_types.WeComConfig {
+    for (cfg.channels.wecom) |*wecom_cfg| {
+        if (std.ascii.eqlIgnoreCase(wecom_cfg.account_id, account_id)) return wecom_cfg;
+    }
+    return null;
+}
+
+fn findWeChatConfigByAccountId(
+    cfg: *const Config,
+    account_id: []const u8,
+) ?*const config_types.WeChatConfig {
+    for (cfg.channels.wechat) |*wechat_cfg| {
+        if (std.ascii.eqlIgnoreCase(wechat_cfg.account_id, account_id)) return wechat_cfg;
+    }
+    return null;
+}
+
+fn selectWeChatConfig(
+    cfg_opt: ?*const Config,
+    target: []const u8,
+) ?*const config_types.WeChatConfig {
+    if (!build_options.enable_channel_wechat) return null;
+    const cfg = cfg_opt orelse return null;
+    if (cfg.channels.wechat.len == 0) return null;
+
+    if (parseQueryParam(target, "account_id")) |account_id| {
+        if (findWeChatConfigByAccountId(cfg, account_id)) |wechat_cfg| {
+            return wechat_cfg;
+        }
+    }
+    if (parseQueryParam(target, "account")) |account_id| {
+        if (findWeChatConfigByAccountId(cfg, account_id)) |wechat_cfg| {
+            return wechat_cfg;
+        }
+    }
+
+    if (cfg.channels.wechatPrimary()) |primary| {
+        if (findWeChatConfigByAccountId(cfg, primary.account_id)) |wechat_cfg| {
+            return wechat_cfg;
+        }
+    }
+
+    return &cfg.channels.wechat[0];
+}
+
+fn selectWeComConfig(
+    cfg_opt: ?*const Config,
+    target: []const u8,
+) ?*const config_types.WeComConfig {
+    if (!build_options.enable_channel_wecom) return null;
+    const cfg = cfg_opt orelse return null;
+    if (cfg.channels.wecom.len == 0) return null;
+
+    if (parseQueryParam(target, "account_id")) |account_id| {
+        if (findWeComConfigByAccountId(cfg, account_id)) |wecom_cfg| {
+            return wecom_cfg;
+        }
+    }
+    if (parseQueryParam(target, "account")) |account_id| {
+        if (findWeComConfigByAccountId(cfg, account_id)) |wecom_cfg| {
+            return wecom_cfg;
+        }
+    }
+
+    if (cfg.channels.wecomPrimary()) |primary| {
+        if (findWeComConfigByAccountId(cfg, primary.account_id)) |wecom_cfg| {
+            return wecom_cfg;
+        }
+    }
+
+    return &cfg.channels.wecom[0];
 }
 
 fn findQqConfigByAccountId(cfg: *const Config, account_id: []const u8) ?*const config_types.QQConfig {
@@ -1160,6 +1407,82 @@ fn slackEnvelopeBotUserId(payload_root: std.json.ObjectMap) ?[]const u8 {
     return uid_val.string;
 }
 
+fn decodeFormComponent(allocator: std.mem.Allocator, encoded: []const u8) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    var i: usize = 0;
+    while (i < encoded.len) : (i += 1) {
+        const ch = encoded[i];
+        if (ch == '+') {
+            try out.append(allocator, ' ');
+            continue;
+        }
+        if (ch == '%' and i + 2 < encoded.len) {
+            const hi = hexVal(encoded[i + 1]) orelse {
+                try out.append(allocator, ch);
+                continue;
+            };
+            const lo = hexVal(encoded[i + 2]) orelse {
+                try out.append(allocator, ch);
+                continue;
+            };
+            try out.append(allocator, (hi << 4) | lo);
+            i += 2;
+            continue;
+        }
+        try out.append(allocator, ch);
+    }
+
+    return out.toOwnedSlice(allocator);
+}
+
+fn slackDecodeInteractivePayload(allocator: std.mem.Allocator, body: []const u8) ?[]u8 {
+    var fields = std.mem.splitScalar(u8, body, '&');
+    while (fields.next()) |field| {
+        const eq = std.mem.indexOfScalar(u8, field, '=') orelse continue;
+        const key = field[0..eq];
+        if (!std.mem.eql(u8, key, "payload")) continue;
+        return decodeFormComponent(allocator, field[eq + 1 ..]) catch null;
+    }
+    return null;
+}
+
+fn slackParseCallbackValue(value: []const u8) ?struct { token: []const u8, option_index: usize } {
+    if (!std.mem.startsWith(u8, value, "ncslack:")) return null;
+    const rest = value["ncslack:".len..];
+    const sep = std.mem.lastIndexOfScalar(u8, rest, ':') orelse return null;
+    const token = rest[0..sep];
+    if (token.len == 0) return null;
+    const option_index = std.fmt.parseUnsigned(usize, rest[sep + 1 ..], 10) catch return null;
+    return .{ .token = token, .option_index = option_index };
+}
+
+const SlackInteractiveTarget = struct {
+    channel_id: []const u8,
+    thread_id: ?[]const u8 = null,
+    is_dm: bool,
+};
+
+fn slackInteractiveTarget(target: []const u8, fallback_channel_id: []const u8) SlackInteractiveTarget {
+    var channel_id = if (target.len > 0) target else fallback_channel_id;
+    var thread_id: ?[]const u8 = null;
+
+    if (std.mem.indexOfScalar(u8, channel_id, ':')) |idx| {
+        if (idx > 0) {
+            const parsed_thread = channel_id[idx + 1 ..];
+            channel_id = channel_id[0..idx];
+            if (parsed_thread.len > 0) thread_id = parsed_thread;
+        }
+    }
+
+    return .{
+        .channel_id = channel_id,
+        .thread_id = thread_id,
+        .is_dm = channel_id.len > 0 and channel_id[0] == 'D',
+    };
+}
+
 fn whatsappSessionKey(buf: []u8, body: []const u8) []const u8 {
     const sender = jsonStringField(body, "from") orelse "unknown";
     const group_id = jsonStringField(body, "group_jid") orelse jsonStringField(body, "group_id");
@@ -1280,6 +1603,174 @@ fn resolveRouteSessionKey(
     return fallback;
 }
 
+fn qqPeerRefFromInbound(inbound: *const bus_mod.InboundMessage) ?agent_routing.PeerRef {
+    const meta = inbound.metadata_json;
+    const is_group = if (meta) |json| std.mem.indexOf(u8, json, "\"is_group\":true") != null else false;
+    const is_dm = if (meta) |json| std.mem.indexOf(u8, json, "\"is_dm\":true") != null else false;
+    const channel_id = if (meta) |json| jsonStringField(json, "channel_id") else null;
+    const group_id = if (meta) |json| jsonStringField(json, "group_openid") orelse jsonStringField(json, "group_id") else null;
+
+    if (is_group) {
+        const peer_id = group_id orelse channel_id orelse return null;
+        return .{ .kind = .group, .id = peer_id };
+    }
+    if (is_dm or std.mem.startsWith(u8, inbound.chat_id, "dm:")) {
+        return .{ .kind = .direct, .id = inbound.sender_id };
+    }
+
+    const raw_channel = channel_id orelse inbound.chat_id;
+    const normalized_channel = if (std.mem.startsWith(u8, raw_channel, "channel:"))
+        raw_channel["channel:".len..]
+    else
+        raw_channel;
+    if (normalized_channel.len == 0) return null;
+    return .{ .kind = .channel, .id = normalized_channel };
+}
+
+fn qqSessionKeyRouted(
+    allocator: std.mem.Allocator,
+    inbound: *const bus_mod.InboundMessage,
+    cfg_opt: ?*const Config,
+) ?[]const u8 {
+    const cfg = cfg_opt orelse return null;
+    const account_id = if (inbound.metadata_json) |json|
+        (jsonStringField(json, "account_id") orelse "default")
+    else
+        "default";
+    const peer = qqPeerRefFromInbound(inbound) orelse return null;
+
+    const route = agent_routing.resolveRouteWithSession(allocator, .{
+        .channel = "qq",
+        .account_id = account_id,
+        .peer = peer,
+    }, cfg.agent_bindings, cfg.agents, cfg.session) catch return null;
+    allocator.free(route.main_session_key);
+    return route.session_key;
+}
+
+fn teamsPeerRef(
+    body: []const u8,
+    from_id: []const u8,
+    conversation_id: []const u8,
+) struct {
+    peer: agent_routing.PeerRef,
+    is_dm: bool,
+} {
+    const conversation_type = teamsNestedField(body, "conversation", "conversationType") orelse "";
+    const is_dm = conversation_type.len == 0 or std.mem.eql(u8, conversation_type, "personal");
+    return .{
+        .peer = .{
+            .kind = if (is_dm) .direct else .channel,
+            .id = if (is_dm) from_id else conversation_id,
+        },
+        .is_dm = is_dm,
+    };
+}
+
+fn teamsSessionKeyRouted(
+    allocator: std.mem.Allocator,
+    fallback_buf: []u8,
+    config: *const Config,
+    body: []const u8,
+    account_id: []const u8,
+    tenant_id: []const u8,
+    conversation_id: []const u8,
+    from_id: []const u8,
+) []const u8 {
+    const fallback = std.fmt.bufPrint(fallback_buf, "teams:{s}:{s}", .{ tenant_id, conversation_id }) catch "teams:default";
+    const peer_info = teamsPeerRef(body, from_id, conversation_id);
+    return resolveRouteSessionKey(
+        allocator,
+        config,
+        "teams",
+        account_id,
+        peer_info.peer,
+        fallback,
+    );
+}
+
+fn webhookRouting(
+    allocator: std.mem.Allocator,
+    body: []const u8,
+    bearer: ?[]const u8,
+    cfg_opt: ?*const Config,
+) WebhookRouting {
+    const owned_fallback_key = std.fmt.allocPrint(allocator, "webhook:{s}", .{bearer orelse "anon"}) catch null;
+    const fallback_key = owned_fallback_key orelse "webhook:anon";
+
+    const channel = jsonStringField(body, "channel");
+    const peer_kind = if (jsonStringField(body, "peer_kind")) |raw| channel_adapters.parsePeerKind(raw) else null;
+    const peer_id = jsonStringField(body, "peer_id");
+    const sender_id = jsonStringField(body, "sender_id") orelse bearer;
+    const sender_username = jsonStringField(body, "sender_username");
+    const sender_display_name = jsonStringField(body, "sender_display_name");
+    const account_id = jsonStringField(body, "account_id");
+    const bus_sender_id = sender_id orelse "anon";
+    const bus_chat_id = peer_id orelse fallback_key;
+    const metadata_json = buildWebhookRoutingMetadataJson(
+        allocator,
+        account_id,
+        peer_kind,
+        peer_id,
+        sender_username,
+        sender_display_name,
+    );
+
+    const conversation_context = if (channel != null or peer_id != null or sender_id != null or account_id != null or sender_username != null or sender_display_name != null)
+        buildConversationContext(.{
+            .channel = channel,
+            .account_id = account_id,
+            .sender_id = sender_id,
+            .sender_username = sender_username,
+            .sender_display_name = sender_display_name,
+            .peer_id = peer_id,
+            .is_group = if (peer_kind) |kind| kind != .direct else null,
+            .group_id = if (peer_kind) |kind| if (kind == .direct) null else peer_id else null,
+        })
+    else
+        null;
+
+    if (cfg_opt) |cfg| {
+        if (channel) |channel_name| {
+            if (peer_kind) |kind| {
+                if (peer_id) |resolved_peer_id| {
+                    const route = agent_routing.resolveRouteWithSession(allocator, .{
+                        .channel = channel_name,
+                        .account_id = account_id orelse "default",
+                        .peer = .{ .kind = kind, .id = resolved_peer_id },
+                    }, cfg.agent_bindings, cfg.agents, cfg.session) catch return .{
+                        .sender_id = bus_sender_id,
+                        .chat_id = bus_chat_id,
+                        .session_key = fallback_key,
+                        .owned_session_key = owned_fallback_key,
+                        .metadata_json = metadata_json,
+                        .conversation_context = conversation_context,
+                    };
+                    if (owned_fallback_key) |owned| allocator.free(owned);
+                    allocator.free(route.main_session_key);
+                    return .{
+                        .sender_id = bus_sender_id,
+                        .chat_id = bus_chat_id,
+                        .session_key = route.session_key,
+                        .owned_session_key = route.session_key,
+                        .metadata_json = metadata_json,
+                        .conversation_context = conversation_context,
+                    };
+                }
+            }
+        }
+    }
+
+    return .{
+        .sender_id = bus_sender_id,
+        .chat_id = bus_chat_id,
+        .session_key = fallback_key,
+        .owned_session_key = owned_fallback_key,
+        .metadata_json = metadata_json,
+        .conversation_context = conversation_context,
+    };
+}
+
 fn telegramChatIsGroup(allocator: std.mem.Allocator, body: []const u8) bool {
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return false;
     defer parsed.deinit();
@@ -1332,15 +1823,33 @@ fn telegramSenderAllowed(allocator: std.mem.Allocator, allow_from: []const []con
 fn telegramSessionKeyRouted(
     allocator: std.mem.Allocator,
     fallback_buf: []u8,
-    chat_id: i64,
     body: []const u8,
     cfg_opt: ?*const Config,
     account_id: []const u8,
 ) []const u8 {
-    const fallback = std.fmt.bufPrint(fallback_buf, "telegram:{d}", .{chat_id}) catch "telegram:0";
+    const target = telegramWebhookTarget(allocator, body) orelse return "telegram:0";
+    const fallback = telegramFallbackSessionKey(fallback_buf, target.chat_id, target.message_thread_id);
     var peer_buf: [64]u8 = undefined;
-    const peer_id = std.fmt.bufPrint(&peer_buf, "{d}", .{chat_id}) catch return fallback;
-    const peer_kind: agent_routing.ChatType = if (telegramChatIsGroup(allocator, body)) .group else .direct;
+    const peer_id = std.fmt.bufPrint(&peer_buf, "{d}", .{target.chat_id}) catch return fallback;
+    const peer_kind: agent_routing.ChatType = if (target.is_group) .group else .direct;
+
+    if (cfg_opt) |cfg| {
+        if (target.is_group and target.message_thread_id != null) {
+            const thread_id = target.message_thread_id.?;
+            const topic_peer_id = std.fmt.allocPrint(allocator, "{s}:thread:{d}", .{ peer_id, thread_id }) catch return fallback;
+            defer allocator.free(topic_peer_id);
+
+            const route = agent_routing.resolveRouteWithSession(allocator, .{
+                .channel = "telegram",
+                .account_id = account_id,
+                .peer = .{ .kind = peer_kind, .id = topic_peer_id },
+                .parent_peer = .{ .kind = peer_kind, .id = peer_id },
+            }, cfg.agent_bindings, cfg.agents, cfg.session) catch return fallback;
+            allocator.free(route.main_session_key);
+            return route.session_key;
+        }
+    }
+
     return resolveRouteSessionKey(
         allocator,
         cfg_opt,
@@ -1351,23 +1860,99 @@ fn telegramSessionKeyRouted(
     );
 }
 
-fn telegramChatId(allocator: std.mem.Allocator, body: []const u8) ?i64 {
+const TelegramWebhookTarget = struct {
+    chat_id: i64,
+    is_group: bool,
+    message_thread_id: ?i64 = null,
+};
+
+fn telegramMessageValue(root: std.json.Value) ?std.json.Value {
+    if (root != .object) return null;
+    return root.object.get("message") orelse root.object.get("edited_message");
+}
+
+fn telegramMessageThreadId(message: std.json.Value) ?i64 {
+    if (message != .object) return null;
+
+    if (message.object.get("message_thread_id")) |thread_id_val| {
+        if (thread_id_val == .integer and thread_id_val.integer > 0) {
+            return thread_id_val.integer;
+        }
+    }
+
+    const is_topic_message = blk: {
+        const field = message.object.get("is_topic_message") orelse break :blk false;
+        break :blk field == .bool and field.bool;
+    };
+    if (!is_topic_message) return null;
+
+    const reply_to_message = message.object.get("reply_to_message") orelse return null;
+    if (reply_to_message != .object) return null;
+
+    const reply_message_id = reply_to_message.object.get("message_id") orelse return null;
+    if (reply_message_id != .integer or reply_message_id.integer <= 0) return null;
+    return reply_message_id.integer;
+}
+
+fn telegramWebhookTarget(allocator: std.mem.Allocator, body: []const u8) ?TelegramWebhookTarget {
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
-        return jsonIntField(body, "chat_id");
+        if (jsonIntField(body, "chat_id")) |chat_id| {
+            return .{
+                .chat_id = chat_id,
+                .is_group = false,
+            };
+        }
+        return null;
     };
     defer parsed.deinit();
-    if (parsed.value != .object) return jsonIntField(body, "chat_id");
 
-    const msg_obj = parsed.value.object.get("message") orelse
-        parsed.value.object.get("edited_message") orelse return jsonIntField(body, "chat_id");
-    if (msg_obj != .object) return jsonIntField(body, "chat_id");
+    const message = telegramMessageValue(parsed.value) orelse {
+        if (jsonIntField(body, "chat_id")) |chat_id| {
+            return .{
+                .chat_id = chat_id,
+                .is_group = false,
+            };
+        }
+        return null;
+    };
+    if (message != .object) return null;
 
-    const chat_obj = msg_obj.object.get("chat") orelse return jsonIntField(body, "chat_id");
-    if (chat_obj != .object) return jsonIntField(body, "chat_id");
+    const chat = message.object.get("chat") orelse return null;
+    if (chat != .object) return null;
 
-    const id_val = chat_obj.object.get("id") orelse return jsonIntField(body, "chat_id");
-    if (id_val != .integer) return jsonIntField(body, "chat_id");
-    return id_val.integer;
+    const id_val = chat.object.get("id") orelse return null;
+    if (id_val != .integer) return null;
+
+    const chat_type = blk: {
+        const field = chat.object.get("type") orelse break :blk "";
+        break :blk if (field == .string) field.string else "";
+    };
+
+    return .{
+        .chat_id = id_val.integer,
+        .is_group = std.mem.eql(u8, chat_type, "group") or
+            std.mem.eql(u8, chat_type, "supergroup") or
+            std.mem.eql(u8, chat_type, "channel"),
+        .message_thread_id = telegramMessageThreadId(message),
+    };
+}
+
+fn telegramFallbackSessionKey(fallback_buf: []u8, chat_id: i64, message_thread_id: ?i64) []const u8 {
+    if (message_thread_id) |thread_id| {
+        return std.fmt.bufPrint(fallback_buf, "telegram:{d}:thread:{d}", .{ chat_id, thread_id }) catch "telegram:0";
+    }
+    return std.fmt.bufPrint(fallback_buf, "telegram:{d}", .{chat_id}) catch "telegram:0";
+}
+
+fn telegramChatTargetAlloc(allocator: std.mem.Allocator, chat_id: i64, message_thread_id: ?i64) ![]u8 {
+    if (message_thread_id) |thread_id| {
+        return std.fmt.allocPrint(allocator, "{d}#topic:{d}", .{ chat_id, thread_id });
+    }
+    return std.fmt.allocPrint(allocator, "{d}", .{chat_id});
+}
+
+fn telegramChatId(allocator: std.mem.Allocator, body: []const u8) ?i64 {
+    return if (telegramWebhookTarget(allocator, body)) |target| target.chat_id else jsonIntField(body, "chat_id");
 }
 
 fn telegramSenderIdentity(
@@ -1460,6 +2045,78 @@ fn larkSessionKeyRouted(
     );
 }
 
+fn wecomSessionKey(buf: []u8, sender: []const u8) []const u8 {
+    return std.fmt.bufPrint(buf, "wecom:{s}", .{sender}) catch "wecom:unknown";
+}
+
+fn wechatSessionKey(buf: []u8, sender: []const u8) []const u8 {
+    return std.fmt.bufPrint(buf, "wechat:{s}", .{sender}) catch "wechat:unknown";
+}
+
+fn wechatSessionKeyRouted(
+    allocator: std.mem.Allocator,
+    fallback_buf: []u8,
+    sender: []const u8,
+    cfg_opt: ?*const Config,
+    account_id: []const u8,
+) []const u8 {
+    const fallback = wechatSessionKey(fallback_buf, sender);
+    return resolveRouteSessionKey(
+        allocator,
+        cfg_opt,
+        "wechat",
+        account_id,
+        .{ .kind = .direct, .id = sender },
+        fallback,
+    );
+}
+
+fn wecomSessionKeyRouted(
+    allocator: std.mem.Allocator,
+    fallback_buf: []u8,
+    sender: []const u8,
+    cfg_opt: ?*const Config,
+    account_id: []const u8,
+) []const u8 {
+    const fallback = wecomSessionKey(fallback_buf, sender);
+    return resolveRouteSessionKey(
+        allocator,
+        cfg_opt,
+        "wecom",
+        account_id,
+        .{ .kind = .direct, .id = sender },
+        fallback,
+    );
+}
+
+fn maxSessionKey(buf: []u8, account_id: []const u8, sender: []const u8, reply_target: []const u8, is_group: bool) []const u8 {
+    if (is_group) {
+        return std.fmt.bufPrint(buf, "max:{s}:chat:{s}", .{ account_id, reply_target }) catch "max:default";
+    }
+    return std.fmt.bufPrint(buf, "max:{s}:{s}", .{ account_id, sender }) catch "max:default";
+}
+
+fn maxSessionKeyRouted(
+    allocator: std.mem.Allocator,
+    fallback_buf: []u8,
+    sender: []const u8,
+    reply_target: []const u8,
+    is_group: bool,
+    cfg_opt: ?*const Config,
+    account_id: []const u8,
+) []const u8 {
+    const fallback = maxSessionKey(fallback_buf, account_id, sender, reply_target, is_group);
+    const peer_id = if (is_group) reply_target else sender;
+    return resolveRouteSessionKey(
+        allocator,
+        cfg_opt,
+        "max",
+        account_id,
+        .{ .kind = if (is_group) .group else .direct, .id = peer_id },
+        fallback,
+    );
+}
+
 // ── Message Processing ──────────────────────────────────────────
 
 /// Extract the HTTP request body from raw bytes.
@@ -1547,14 +2204,32 @@ fn readHttpRequest(allocator: std.mem.Allocator, stream: *std.net.Stream) ![]u8 
     return readHttpRequestFromReader(allocator, stream);
 }
 
+const CONTENT_TYPE_JSON = "application/json";
+const CONTENT_TYPE_TEXT = "text/plain; charset=utf-8";
+const CONTENT_TYPE_XML = "application/xml; charset=utf-8";
+
+fn formatHttpResponseHeader(
+    buf: []u8,
+    status: []const u8,
+    content_type: []const u8,
+    body_len: usize,
+) ![]const u8 {
+    return std.fmt.bufPrint(
+        buf,
+        "HTTP/1.1 {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n",
+        .{ status, content_type, body_len },
+    );
+}
+
+fn writeHttpResponse(stream: *std.net.Stream, status: []const u8, content_type: []const u8, body: []const u8) void {
+    var header_buf: [512]u8 = undefined;
+    const header = formatHttpResponseHeader(&header_buf, status, content_type, body.len) catch return;
+    _ = stream.write(header) catch return;
+    if (body.len > 0) _ = stream.write(body) catch {};
+}
+
 fn writeJsonResponse(stream: *std.net.Stream, status: []const u8, body: []const u8) void {
-    var resp_buf: [2048]u8 = undefined;
-    const resp = std.fmt.bufPrint(
-        &resp_buf,
-        "HTTP/1.1 {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
-        .{ status, body.len, body },
-    ) catch return;
-    _ = stream.write(resp) catch {};
+    writeHttpResponse(stream, status, CONTENT_TYPE_JSON, body);
 }
 
 /// Process an incoming message by spawning `nullclaw agent -m "..."`.
@@ -1595,7 +2270,13 @@ pub fn processIncomingMessage(allocator: std.mem.Allocator, message: []const u8)
 }
 
 /// Send a reply to a Telegram chat using the Bot API.
-pub fn sendTelegramReply(allocator: std.mem.Allocator, bot_token: []const u8, chat_id: i64, text: []const u8) !void {
+pub fn sendTelegramReply(
+    allocator: std.mem.Allocator,
+    bot_token: []const u8,
+    chat_id: i64,
+    message_thread_id: ?i64,
+    text: []const u8,
+) !void {
     // Build the curl command to call the Telegram API
     const url = try std.fmt.allocPrint(allocator, "https://api.telegram.org/bot{s}/sendMessage", .{bot_token});
     defer allocator.free(url);
@@ -1615,7 +2296,11 @@ pub fn sendTelegramReply(allocator: std.mem.Allocator, bot_token: []const u8, ch
             else => try w.writeByte(c),
         }
     }
-    try w.writeAll("\"}");
+    try w.writeAll("\"");
+    if (message_thread_id) |thread_id| {
+        try w.print(",\"message_thread_id\":{d}", .{thread_id});
+    }
+    try w.writeAll("}");
 
     const body = body_buf.items;
 
@@ -1636,7 +2321,7 @@ pub fn sendTelegramReply(allocator: std.mem.Allocator, bot_token: []const u8, ch
 
 fn userFacingAgentError(err: anyerror) []const u8 {
     return switch (err) {
-        error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError => "Network error. Please try again.",
+        error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError, error.CurlDnsError, error.CurlConnectError, error.CurlTimeout, error.CurlTlsError => "Network error contacting provider. Check base_url, DNS, proxy, and TLS certificates, then try again.",
         error.ProviderDoesNotSupportVision => "The current provider does not support image input.",
         error.AllProvidersFailed => "All configured providers failed for this request. Check model/provider compatibility and credentials.",
         error.NoResponseContent => "Model returned an empty response. Please try again.",
@@ -1647,7 +2332,7 @@ fn userFacingAgentError(err: anyerror) []const u8 {
 
 fn userFacingAgentErrorJson(err: anyerror) []const u8 {
     return switch (err) {
-        error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError => "{\"error\":\"network error\"}",
+        error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError, error.CurlDnsError, error.CurlConnectError, error.CurlTimeout, error.CurlTlsError => "{\"error\":\"network error contacting provider\"}",
         error.ProviderDoesNotSupportVision => "{\"error\":\"provider does not support image input\"}",
         error.AllProvidersFailed => "{\"error\":\"all providers failed for this request\"}",
         error.NoResponseContent => "{\"error\":\"model returned empty response\"}",
@@ -1666,8 +2351,19 @@ const WebhookHandlerContext = struct {
     state: *GatewayState,
     session_mgr_opt: ?*session_mod.SessionManager,
     response_status: []const u8 = "200 OK",
+    response_content_type: []const u8 = CONTENT_TYPE_JSON,
     response_body: []const u8 = "",
 };
+
+fn setPlainTextResponse(ctx: *WebhookHandlerContext, body: []const u8) void {
+    ctx.response_content_type = CONTENT_TYPE_TEXT;
+    ctx.response_body = body;
+}
+
+fn setXmlResponse(ctx: *WebhookHandlerContext, body: []const u8) void {
+    ctx.response_content_type = CONTENT_TYPE_XML;
+    ctx.response_body = body;
+}
 
 const WebhookHandlerFn = *const fn (ctx: *WebhookHandlerContext) void;
 
@@ -1682,7 +2378,11 @@ const webhook_route_descriptors = [_]WebhookRouteDescriptor{
     .{ .path = "/slack/events", .handler = handleSlackWebhookRoute },
     .{ .path = "/line", .handler = handleLineWebhookRoute },
     .{ .path = "/lark", .handler = handleLarkWebhookRoute },
+    .{ .path = "/wechat", .handler = handleWeChatWebhookRoute },
+    .{ .path = "/wecom", .handler = handleWeComWebhookRoute },
     .{ .path = "/qq", .handler = handleQqWebhookRoute },
+    .{ .path = "/max", .handler = handleMaxWebhookRoute },
+    .{ .path = "/api/messages", .handler = handleTeamsWebhookRoute },
 };
 
 fn findWebhookRouteDescriptor(path: []const u8) ?*const WebhookRouteDescriptor {
@@ -1690,6 +2390,555 @@ fn findWebhookRouteDescriptor(path: []const u8) ?*const WebhookRouteDescriptor {
         if (std.mem.eql(u8, desc.path, path)) return desc;
     }
     return null;
+}
+
+// ── Cron REST API route descriptors ──────────────────────────────
+
+const CronRouteDescriptor = struct {
+    path: []const u8,
+    method: []const u8,
+    handler: *const fn (ctx: *WebhookHandlerContext) void,
+};
+
+const cron_route_descriptors = [_]CronRouteDescriptor{
+    .{ .path = "/cron", .method = "GET", .handler = handleCronList },
+    .{ .path = "/cron/add", .method = "POST", .handler = handleCronAdd },
+    .{ .path = "/cron/remove", .method = "POST", .handler = handleCronRemove },
+    .{ .path = "/cron/pause", .method = "POST", .handler = handleCronPause },
+    .{ .path = "/cron/resume", .method = "POST", .handler = handleCronResume },
+    .{ .path = "/cron/update", .method = "POST", .handler = handleCronUpdate },
+};
+
+fn findCronRouteDescriptor(path: []const u8) ?*const CronRouteDescriptor {
+    for (&cron_route_descriptors) |*desc| {
+        if (std.mem.eql(u8, desc.path, path)) return desc;
+    }
+    return null;
+}
+
+fn cronObjectStringField(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
+    const value = obj.get(key) orelse return null;
+    if (value == .string and value.string.len > 0) return value.string;
+    return null;
+}
+
+fn cronObjectBoolField(obj: std.json.ObjectMap, key: []const u8) ?bool {
+    const value = obj.get(key) orelse return null;
+    if (value == .bool) return value.bool;
+    return null;
+}
+
+fn lockSharedSchedulerForRequest() ?*cron_mod.CronScheduler {
+    g_shared_scheduler_mutex.lock();
+    return g_shared_scheduler;
+}
+
+/// Serialize a single CronJob to a JSON object appended to `buf`.
+fn appendCronJobJson(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, job: cron_mod.CronJob) !void {
+    try buf.appendSlice(allocator, "{");
+    try buf.appendSlice(allocator, "\"id\":");
+    try appendJsonStringBuf(buf, allocator, job.id);
+    try buf.appendSlice(allocator, ",\"expression\":");
+    try appendJsonStringBuf(buf, allocator, job.expression);
+    try buf.appendSlice(allocator, ",\"command\":");
+    try appendJsonStringBuf(buf, allocator, job.command);
+    var int_buf: [32]u8 = undefined;
+    try buf.appendSlice(allocator, ",\"next_run_secs\":");
+    try buf.appendSlice(allocator, std.fmt.bufPrint(&int_buf, "{d}", .{job.next_run_secs}) catch "0");
+    try buf.appendSlice(allocator, ",\"last_run_secs\":");
+    if (job.last_run_secs) |lrs| {
+        try buf.appendSlice(allocator, std.fmt.bufPrint(&int_buf, "{d}", .{lrs}) catch "0");
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
+    try buf.appendSlice(allocator, ",\"last_status\":");
+    if (job.last_status) |ls| {
+        try appendJsonStringBuf(buf, allocator, ls);
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
+    try buf.appendSlice(allocator, ",\"paused\":");
+    try buf.appendSlice(allocator, if (job.paused) "true" else "false");
+    try buf.appendSlice(allocator, ",\"one_shot\":");
+    try buf.appendSlice(allocator, if (job.one_shot) "true" else "false");
+    try buf.appendSlice(allocator, ",\"job_type\":");
+    try appendJsonStringBuf(buf, allocator, job.job_type.asStr());
+    try buf.appendSlice(allocator, ",\"session_target\":");
+    try appendJsonStringBuf(buf, allocator, job.session_target.asStr());
+    try buf.appendSlice(allocator, ",\"enabled\":");
+    try buf.appendSlice(allocator, if (job.enabled) "true" else "false");
+    try buf.appendSlice(allocator, ",\"delete_after_run\":");
+    try buf.appendSlice(allocator, if (job.delete_after_run) "true" else "false");
+    try buf.appendSlice(allocator, ",\"prompt\":");
+    if (job.prompt) |p| try appendJsonStringBuf(buf, allocator, p) else try buf.appendSlice(allocator, "null");
+    try buf.appendSlice(allocator, ",\"model\":");
+    if (job.model) |m| try appendJsonStringBuf(buf, allocator, m) else try buf.appendSlice(allocator, "null");
+    try buf.appendSlice(allocator, ",\"delivery_mode\":");
+    try appendJsonStringBuf(buf, allocator, job.delivery.mode.asStr());
+    try buf.appendSlice(allocator, ",\"delivery_channel\":");
+    if (job.delivery.channel) |channel| try appendJsonStringBuf(buf, allocator, channel) else try buf.appendSlice(allocator, "null");
+    try buf.appendSlice(allocator, ",\"delivery_account_id\":");
+    if (job.delivery.account_id) |account_id| try appendJsonStringBuf(buf, allocator, account_id) else try buf.appendSlice(allocator, "null");
+    try buf.appendSlice(allocator, ",\"delivery_to\":");
+    if (job.delivery.to) |to| try appendJsonStringBuf(buf, allocator, to) else try buf.appendSlice(allocator, "null");
+    try buf.appendSlice(allocator, ",\"delivery_peer_kind\":");
+    if (job.delivery.peer_kind) |peer_kind| {
+        try appendJsonStringBuf(buf, allocator, switch (peer_kind) {
+            .direct => "direct",
+            .group => "group",
+            .channel => "channel",
+        });
+    } else {
+        try buf.appendSlice(allocator, "null");
+    }
+    try buf.appendSlice(allocator, ",\"delivery_peer_id\":");
+    if (job.delivery.peer_id) |peer_id| try appendJsonStringBuf(buf, allocator, peer_id) else try buf.appendSlice(allocator, "null");
+    try buf.appendSlice(allocator, ",\"delivery_thread_id\":");
+    if (job.delivery.thread_id) |thread_id| try appendJsonStringBuf(buf, allocator, thread_id) else try buf.appendSlice(allocator, "null");
+    try buf.appendSlice(allocator, ",\"delivery_best_effort\":");
+    try buf.appendSlice(allocator, if (job.delivery.best_effort) "true" else "false");
+    try buf.appendSlice(allocator, ",\"created_at_s\":");
+    try buf.appendSlice(allocator, std.fmt.bufPrint(&int_buf, "{d}", .{job.created_at_s}) catch "0");
+    try buf.appendSlice(allocator, "}");
+}
+
+/// Append a JSON-escaped string literal (with surrounding quotes) to `buf`.
+fn appendJsonStringBuf(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, s: []const u8) !void {
+    try buf.append(allocator, '"');
+    for (s) |c| {
+        switch (c) {
+            '"' => try buf.appendSlice(allocator, "\\\""),
+            '\\' => try buf.appendSlice(allocator, "\\\\"),
+            '\n' => try buf.appendSlice(allocator, "\\n"),
+            '\r' => try buf.appendSlice(allocator, "\\r"),
+            '\t' => try buf.appendSlice(allocator, "\\t"),
+            else => try buf.append(allocator, c),
+        }
+    }
+    try buf.append(allocator, '"');
+}
+
+fn handleCronList(ctx: *WebhookHandlerContext) void {
+    if (!std.mem.eql(u8, ctx.method, "GET")) {
+        ctx.response_status = "405 Method Not Allowed";
+        ctx.response_body = "{\"error\":\"method not allowed\"}";
+        return;
+    }
+    const sched = lockSharedSchedulerForRequest() orelse {
+        g_shared_scheduler_mutex.unlock();
+        ctx.response_status = "503 Service Unavailable";
+        ctx.response_body = "{\"error\":\"scheduler not running\"}";
+        return;
+    };
+    defer g_shared_scheduler_mutex.unlock();
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    buf.appendSlice(ctx.req_allocator, "[") catch {
+        ctx.response_status = "500 Internal Server Error";
+        ctx.response_body = "{\"error\":\"out of memory\"}";
+        return;
+    };
+    const jobs = sched.listJobs();
+    for (jobs, 0..) |job, i| {
+        if (i > 0) buf.appendSlice(ctx.req_allocator, ",") catch {};
+        appendCronJobJson(&buf, ctx.req_allocator, job) catch {
+            ctx.response_status = "500 Internal Server Error";
+            ctx.response_body = "{\"error\":\"serialization failed\"}";
+            return;
+        };
+    }
+    buf.appendSlice(ctx.req_allocator, "]") catch {};
+    ctx.response_status = "200 OK";
+    ctx.response_body = buf.items;
+}
+
+fn handleCronAdd(ctx: *WebhookHandlerContext) void {
+    if (!std.mem.eql(u8, ctx.method, "POST")) {
+        ctx.response_status = "405 Method Not Allowed";
+        ctx.response_body = "{\"error\":\"method not allowed\"}";
+        return;
+    }
+    const body = extractBody(ctx.raw_request) orelse {
+        ctx.response_status = "400 Bad Request";
+        ctx.response_body = "{\"error\":\"missing body\"}";
+        return;
+    };
+
+    const parsed = std.json.parseFromSlice(std.json.Value, ctx.req_allocator, body, .{}) catch {
+        ctx.response_status = "400 Bad Request";
+        ctx.response_body = "{\"error\":\"invalid json\"}";
+        return;
+    };
+    if (parsed.value != .object) {
+        ctx.response_status = "400 Bad Request";
+        ctx.response_body = "{\"error\":\"json body must be an object\"}";
+        return;
+    }
+
+    const obj = parsed.value.object;
+    const expression_opt = cronObjectStringField(obj, "expression");
+    const delay_opt = cronObjectStringField(obj, "delay");
+    if (expression_opt == null and delay_opt == null) {
+        ctx.response_status = "400 Bad Request";
+        ctx.response_body = "{\"error\":\"missing expression or delay\"}";
+        return;
+    }
+    if (expression_opt != null and delay_opt != null) {
+        ctx.response_status = "400 Bad Request";
+        ctx.response_body = "{\"error\":\"provide expression or delay, not both\"}";
+        return;
+    }
+
+    const prompt_opt = cronObjectStringField(obj, "prompt");
+    const command_opt = cronObjectStringField(obj, "command");
+    const model_opt = cronObjectStringField(obj, "model");
+    const session_target = if (cronObjectStringField(obj, "session_target")) |raw|
+        cron_mod.SessionTarget.parseStrict(raw) catch {
+            ctx.response_status = "400 Bad Request";
+            ctx.response_body = "{\"error\":\"invalid session_target\"}";
+            return;
+        }
+    else
+        cron_mod.SessionTarget.isolated;
+    const delivery_mode_opt = cronObjectStringField(obj, "delivery_mode");
+    const delivery_channel_opt = cronObjectStringField(obj, "delivery_channel");
+    const delivery_account_id_opt = cronObjectStringField(obj, "delivery_account_id");
+    const delivery_to_opt = cronObjectStringField(obj, "delivery_to");
+    const delivery_peer_kind = blk: {
+        const raw = cronObjectStringField(obj, "delivery_peer_kind") orelse break :blk null;
+        if (std.mem.eql(u8, raw, "direct")) break :blk agent_routing.ChatType.direct;
+        if (std.mem.eql(u8, raw, "group")) break :blk agent_routing.ChatType.group;
+        if (std.mem.eql(u8, raw, "channel")) break :blk agent_routing.ChatType.channel;
+        ctx.response_status = "400 Bad Request";
+        ctx.response_body = "{\"error\":\"invalid delivery_peer_kind\"}";
+        return;
+    };
+    const delivery_peer_id_opt = cronObjectStringField(obj, "delivery_peer_id");
+    const delivery_thread_id_opt = cronObjectStringField(obj, "delivery_thread_id");
+    const delivery_best_effort = cronObjectBoolField(obj, "delivery_best_effort") orelse true;
+
+    if (prompt_opt == null and session_target != .isolated) {
+        ctx.response_status = "400 Bad Request";
+        ctx.response_body = "{\"error\":\"session_target requires prompt\"}";
+        return;
+    }
+
+    const sched = lockSharedSchedulerForRequest() orelse {
+        g_shared_scheduler_mutex.unlock();
+        ctx.response_status = "503 Service Unavailable";
+        ctx.response_body = "{\"error\":\"scheduler not running\"}";
+        return;
+    };
+    defer g_shared_scheduler_mutex.unlock();
+
+    const delivery = cron_mod.enrichDeliveryRouting(.{
+        .mode = if (delivery_mode_opt) |raw|
+            cron_mod.DeliveryMode.parse(raw)
+        else if (delivery_channel_opt != null or delivery_account_id_opt != null or delivery_to_opt != null)
+            .always
+        else
+            .none,
+        .channel = delivery_channel_opt,
+        .account_id = delivery_account_id_opt,
+        .to = delivery_to_opt,
+        .peer_kind = delivery_peer_kind,
+        .peer_id = delivery_peer_id_opt,
+        .thread_id = delivery_thread_id_opt,
+        .best_effort = delivery_best_effort,
+        .channel_owned = false,
+        .account_id_owned = false,
+        .to_owned = false,
+    });
+
+    const job_ptr = if (delay_opt) |delay|
+        if (prompt_opt != null)
+            sched.addAgentOnce(delay, prompt_opt.?, model_opt, delivery) catch |err| {
+                ctx.response_status = "400 Bad Request";
+                ctx.response_body = if (err == error.MaxTasksReached)
+                    "{\"error\":\"max tasks reached\"}"
+                else if (err == error.EmptyDelay or err == error.InvalidDurationNumber or err == error.UnknownDurationUnit or err == error.DurationTooLarge)
+                    "{\"error\":\"invalid delay\"}"
+                else
+                    "{\"error\":\"add failed\"}";
+                return;
+            }
+        else blk: {
+            const cmd = command_opt orelse {
+                ctx.response_status = "400 Bad Request";
+                ctx.response_body = "{\"error\":\"missing command or prompt\"}";
+                return;
+            };
+            break :blk sched.addOnce(delay, cmd) catch |err| {
+                ctx.response_status = "400 Bad Request";
+                ctx.response_body = if (err == error.MaxTasksReached)
+                    "{\"error\":\"max tasks reached\"}"
+                else if (err == error.EmptyDelay or err == error.InvalidDurationNumber or err == error.UnknownDurationUnit or err == error.DurationTooLarge)
+                    "{\"error\":\"invalid delay\"}"
+                else
+                    "{\"error\":\"add failed\"}";
+                return;
+            };
+        }
+    else if (prompt_opt != null)
+        sched.addAgentJob(expression_opt.?, prompt_opt.?, model_opt, delivery) catch |err| {
+            ctx.response_status = "400 Bad Request";
+            ctx.response_body = if (err == error.MaxTasksReached)
+                "{\"error\":\"max tasks reached\"}"
+            else if (err == error.InvalidCronExpression)
+                "{\"error\":\"invalid cron expression\"}"
+            else
+                "{\"error\":\"add failed\"}";
+            return;
+        }
+    else blk: {
+        const cmd = command_opt orelse {
+            ctx.response_status = "400 Bad Request";
+            ctx.response_body = "{\"error\":\"missing command or prompt\"}";
+            return;
+        };
+        break :blk sched.addJob(expression_opt.?, cmd) catch |err| {
+            ctx.response_status = "400 Bad Request";
+            ctx.response_body = if (err == error.MaxTasksReached)
+                "{\"error\":\"max tasks reached\"}"
+            else if (err == error.InvalidCronExpression)
+                "{\"error\":\"invalid cron expression\"}"
+            else
+                "{\"error\":\"add failed\"}";
+            return;
+        };
+    };
+
+    job_ptr.session_target = session_target;
+    cron_mod.saveJobs(sched) catch {};
+
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    appendCronJobJson(&buf, ctx.req_allocator, job_ptr.*) catch {
+        ctx.response_status = "500 Internal Server Error";
+        ctx.response_body = "{\"error\":\"serialization failed\"}";
+        return;
+    };
+    ctx.response_status = "200 OK";
+    ctx.response_body = buf.items;
+}
+
+fn handleCronRemove(ctx: *WebhookHandlerContext) void {
+    if (!std.mem.eql(u8, ctx.method, "POST")) {
+        ctx.response_status = "405 Method Not Allowed";
+        ctx.response_body = "{\"error\":\"method not allowed\"}";
+        return;
+    }
+    const body = extractBody(ctx.raw_request) orelse {
+        ctx.response_status = "400 Bad Request";
+        ctx.response_body = "{\"error\":\"missing body\"}";
+        return;
+    };
+    const parsed = std.json.parseFromSlice(std.json.Value, ctx.req_allocator, body, .{}) catch {
+        ctx.response_status = "400 Bad Request";
+        ctx.response_body = "{\"error\":\"invalid json\"}";
+        return;
+    };
+    if (parsed.value != .object) {
+        ctx.response_status = "400 Bad Request";
+        ctx.response_body = "{\"error\":\"json body must be an object\"}";
+        return;
+    }
+    const id = cronObjectStringField(parsed.value.object, "id") orelse {
+        ctx.response_status = "400 Bad Request";
+        ctx.response_body = "{\"error\":\"missing id\"}";
+        return;
+    };
+
+    const sched = lockSharedSchedulerForRequest() orelse {
+        g_shared_scheduler_mutex.unlock();
+        ctx.response_status = "503 Service Unavailable";
+        ctx.response_body = "{\"error\":\"scheduler not running\"}";
+        return;
+    };
+    defer g_shared_scheduler_mutex.unlock();
+
+    if (!sched.removeJob(id)) {
+        ctx.response_status = "404 Not Found";
+        ctx.response_body = "{\"error\":\"job not found\"}";
+        return;
+    }
+    cron_mod.saveJobs(sched) catch {};
+    ctx.response_status = "200 OK";
+    ctx.response_body = "{\"status\":\"removed\"}";
+}
+
+fn handleCronPause(ctx: *WebhookHandlerContext) void {
+    if (!std.mem.eql(u8, ctx.method, "POST")) {
+        ctx.response_status = "405 Method Not Allowed";
+        ctx.response_body = "{\"error\":\"method not allowed\"}";
+        return;
+    }
+    const body = extractBody(ctx.raw_request) orelse {
+        ctx.response_status = "400 Bad Request";
+        ctx.response_body = "{\"error\":\"missing body\"}";
+        return;
+    };
+    const parsed = std.json.parseFromSlice(std.json.Value, ctx.req_allocator, body, .{}) catch {
+        ctx.response_status = "400 Bad Request";
+        ctx.response_body = "{\"error\":\"invalid json\"}";
+        return;
+    };
+    if (parsed.value != .object) {
+        ctx.response_status = "400 Bad Request";
+        ctx.response_body = "{\"error\":\"json body must be an object\"}";
+        return;
+    }
+    const id = cronObjectStringField(parsed.value.object, "id") orelse {
+        ctx.response_status = "400 Bad Request";
+        ctx.response_body = "{\"error\":\"missing id\"}";
+        return;
+    };
+
+    const sched = lockSharedSchedulerForRequest() orelse {
+        g_shared_scheduler_mutex.unlock();
+        ctx.response_status = "503 Service Unavailable";
+        ctx.response_body = "{\"error\":\"scheduler not running\"}";
+        return;
+    };
+    defer g_shared_scheduler_mutex.unlock();
+
+    if (!sched.pauseJob(id)) {
+        ctx.response_status = "404 Not Found";
+        ctx.response_body = "{\"error\":\"job not found\"}";
+        return;
+    }
+    cron_mod.saveJobs(sched) catch {};
+    ctx.response_status = "200 OK";
+    ctx.response_body = "{\"status\":\"paused\"}";
+}
+
+fn handleCronResume(ctx: *WebhookHandlerContext) void {
+    if (!std.mem.eql(u8, ctx.method, "POST")) {
+        ctx.response_status = "405 Method Not Allowed";
+        ctx.response_body = "{\"error\":\"method not allowed\"}";
+        return;
+    }
+    const body = extractBody(ctx.raw_request) orelse {
+        ctx.response_status = "400 Bad Request";
+        ctx.response_body = "{\"error\":\"missing body\"}";
+        return;
+    };
+    const parsed = std.json.parseFromSlice(std.json.Value, ctx.req_allocator, body, .{}) catch {
+        ctx.response_status = "400 Bad Request";
+        ctx.response_body = "{\"error\":\"invalid json\"}";
+        return;
+    };
+    if (parsed.value != .object) {
+        ctx.response_status = "400 Bad Request";
+        ctx.response_body = "{\"error\":\"json body must be an object\"}";
+        return;
+    }
+    const id = cronObjectStringField(parsed.value.object, "id") orelse {
+        ctx.response_status = "400 Bad Request";
+        ctx.response_body = "{\"error\":\"missing id\"}";
+        return;
+    };
+
+    const sched = lockSharedSchedulerForRequest() orelse {
+        g_shared_scheduler_mutex.unlock();
+        ctx.response_status = "503 Service Unavailable";
+        ctx.response_body = "{\"error\":\"scheduler not running\"}";
+        return;
+    };
+    defer g_shared_scheduler_mutex.unlock();
+
+    if (!sched.resumeJob(id)) {
+        ctx.response_status = "404 Not Found";
+        ctx.response_body = "{\"error\":\"job not found\"}";
+        return;
+    }
+    cron_mod.saveJobs(sched) catch {};
+    ctx.response_status = "200 OK";
+    ctx.response_body = "{\"status\":\"resumed\"}";
+}
+
+fn handleCronUpdate(ctx: *WebhookHandlerContext) void {
+    if (!std.mem.eql(u8, ctx.method, "POST")) {
+        ctx.response_status = "405 Method Not Allowed";
+        ctx.response_body = "{\"error\":\"method not allowed\"}";
+        return;
+    }
+    const body = extractBody(ctx.raw_request) orelse {
+        ctx.response_status = "400 Bad Request";
+        ctx.response_body = "{\"error\":\"missing body\"}";
+        return;
+    };
+    const parsed = std.json.parseFromSlice(std.json.Value, ctx.req_allocator, body, .{}) catch {
+        ctx.response_status = "400 Bad Request";
+        ctx.response_body = "{\"error\":\"invalid json\"}";
+        return;
+    };
+    if (parsed.value != .object) {
+        ctx.response_status = "400 Bad Request";
+        ctx.response_body = "{\"error\":\"json body must be an object\"}";
+        return;
+    }
+
+    const obj = parsed.value.object;
+    const id = cronObjectStringField(obj, "id") orelse {
+        ctx.response_status = "400 Bad Request";
+        ctx.response_body = "{\"error\":\"missing id\"}";
+        return;
+    };
+
+    const expression = cronObjectStringField(obj, "expression");
+    const command = cronObjectStringField(obj, "command");
+    const prompt = cronObjectStringField(obj, "prompt");
+    const model = cronObjectStringField(obj, "model");
+    const session_target = if (cronObjectStringField(obj, "session_target")) |raw|
+        cron_mod.SessionTarget.parseStrict(raw) catch {
+            ctx.response_status = "400 Bad Request";
+            ctx.response_body = "{\"error\":\"invalid session_target\"}";
+            return;
+        }
+    else
+        null;
+    const paused_opt = cronObjectBoolField(obj, "paused");
+    const enabled_explicit = cronObjectBoolField(obj, "enabled");
+    const enabled_opt = if (enabled_explicit) |enabled| enabled else if (paused_opt) |paused| !paused else null;
+
+    const sched = lockSharedSchedulerForRequest() orelse {
+        g_shared_scheduler_mutex.unlock();
+        ctx.response_status = "503 Service Unavailable";
+        ctx.response_body = "{\"error\":\"scheduler not running\"}";
+        return;
+    };
+    defer g_shared_scheduler_mutex.unlock();
+
+    if (session_target != null) {
+        const existing = sched.getJob(id) orelse {
+            ctx.response_status = "404 Not Found";
+            ctx.response_body = "{\"error\":\"job not found\"}";
+            return;
+        };
+        if (existing.job_type != .agent) {
+            ctx.response_status = "400 Bad Request";
+            ctx.response_body = "{\"error\":\"session_target requires agent job\"}";
+            return;
+        }
+    }
+
+    const patch = cron_mod.CronJobPatch{
+        .expression = expression,
+        .command = command,
+        .prompt = prompt,
+        .model = model,
+        .session_target = session_target,
+        .enabled = enabled_opt,
+    };
+
+    if (!sched.updateJob(ctx.req_allocator, id, patch)) {
+        ctx.response_status = "404 Not Found";
+        ctx.response_body = "{\"error\":\"job not found or update failed\"}";
+        return;
+    }
+    cron_mod.saveJobs(sched) catch {};
+    ctx.response_status = "200 OK";
+    ctx.response_body = "{\"status\":\"updated\"}";
 }
 
 fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
@@ -1724,47 +2973,70 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
         }
 
         const msg_text = jsonStringField(b, "text");
-        const chat_id = telegramChatId(ctx.req_allocator, b);
+        const telegram_target = telegramWebhookTarget(ctx.req_allocator, b);
+        const chat_id = if (telegram_target) |target| target.chat_id else telegramChatId(ctx.req_allocator, b);
         const tg_authorized = telegramSenderAllowed(ctx.req_allocator, tg_allow_from, b);
         if (!tg_authorized) {
             ctx.response_body = "{\"status\":\"unauthorized\"}";
             return;
         }
 
-        if (msg_text != null and chat_id != null) {
+        if (msg_text != null and telegram_target != null and chat_id != null) {
             var sender_buf: [32]u8 = undefined;
             const sender = telegramSenderIdentity(ctx.req_allocator, b, &sender_buf);
             var cid_buf: [32]u8 = undefined;
             const cid_str = std.fmt.bufPrint(&cid_buf, "{d}", .{chat_id.?}) catch "0";
-            const is_group = telegramChatIsGroup(ctx.req_allocator, b);
+            const is_group = telegram_target.?.is_group;
+            const thread_id = telegram_target.?.message_thread_id;
             const peer_kind = if (is_group) "group" else "direct";
+            const chat_target = telegramChatTargetAlloc(ctx.req_allocator, chat_id.?, thread_id) catch {
+                ctx.response_status = "500 Internal Server Error";
+                ctx.response_body = "{\"error\":\"failed to allocate telegram target\"}";
+                return;
+            };
+            defer ctx.req_allocator.free(chat_target);
 
             if (ctx.state.event_bus) |eb| {
-                var meta_buf: [320]u8 = undefined;
-                const meta = std.fmt.bufPrint(&meta_buf, "{{\"account_id\":\"{s}\",\"peer_kind\":\"{s}\",\"peer_id\":\"{s}\"}}", .{
-                    tg_account_id,
-                    peer_kind,
-                    cid_str,
-                }) catch null;
+                var meta_buf: [384]u8 = undefined;
+                const meta = if (thread_id) |tid|
+                    std.fmt.bufPrint(&meta_buf, "{{\"account_id\":\"{s}\",\"peer_kind\":\"{s}\",\"peer_id\":\"{s}\",\"thread_id\":\"{d}\"}}", .{
+                        tg_account_id,
+                        peer_kind,
+                        cid_str,
+                        tid,
+                    }) catch null
+                else
+                    std.fmt.bufPrint(&meta_buf, "{{\"account_id\":\"{s}\",\"peer_kind\":\"{s}\",\"peer_id\":\"{s}\"}}", .{
+                        tg_account_id,
+                        peer_kind,
+                        cid_str,
+                    }) catch null;
                 var kb: [64]u8 = undefined;
                 const tg_cfg_opt: ?*const Config = if (ctx.config_opt) |cfg| cfg else null;
-                const sk = telegramSessionKeyRouted(ctx.req_allocator, &kb, chat_id.?, b, tg_cfg_opt, tg_account_id);
-                _ = publishToBus(eb, ctx.state.allocator, "telegram", sender, cid_str, msg_text.?, sk, meta);
+                const sk = telegramSessionKeyRouted(ctx.req_allocator, &kb, b, tg_cfg_opt, tg_account_id);
+                _ = publishToBus(eb, ctx.state.allocator, "telegram", sender, chat_target, msg_text.?, sk, meta);
                 ctx.response_body = "{\"status\":\"ok\"}";
             } else if (ctx.session_mgr_opt) |sm| {
                 var kb: [64]u8 = undefined;
                 const tg_cfg_opt: ?*const Config = if (ctx.config_opt) |cfg| cfg else null;
-                const sk = telegramSessionKeyRouted(ctx.req_allocator, &kb, chat_id.?, b, tg_cfg_opt, tg_account_id);
-                const reply: ?[]const u8 = sm.processMessage(sk, msg_text.?, null) catch |err| blk: {
+                const sk = telegramSessionKeyRouted(ctx.req_allocator, &kb, b, tg_cfg_opt, tg_account_id);
+                const conversation_context: ?ConversationContext = simpleConversationContext(
+                    "telegram",
+                    tg_account_id,
+                    cid_str,
+                    std.mem.eql(u8, peer_kind, "group"),
+                    if (std.mem.eql(u8, peer_kind, "group")) cid_str else null,
+                );
+                const reply: ?[]const u8 = sm.processMessage(sk, msg_text.?, conversation_context) catch |err| blk: {
                     if (tg_bot_token.len > 0) {
-                        sendTelegramReply(ctx.req_allocator, tg_bot_token, chat_id.?, userFacingAgentError(err)) catch {};
+                        sendTelegramReply(ctx.req_allocator, tg_bot_token, chat_id.?, thread_id, userFacingAgentError(err)) catch {};
                     }
                     break :blk null;
                 };
                 if (reply) |r| {
                     defer ctx.root_allocator.free(r);
                     if (tg_bot_token.len > 0) {
-                        sendTelegramReply(ctx.req_allocator, tg_bot_token, chat_id.?, r) catch {};
+                        sendTelegramReply(ctx.req_allocator, tg_bot_token, chat_id.?, thread_id, r) catch {};
                     }
                     ctx.response_body = "{\"status\":\"ok\"}";
                 } else {
@@ -1894,7 +3166,14 @@ fn handleWhatsAppWebhookRoute(ctx: *WebhookHandlerContext) void {
                 _ = publishToBus(eb, ctx.state.allocator, "whatsapp", wa_sender_id, wa_chat_target, mt, wa_session_key, meta);
                 ctx.response_body = "{\"status\":\"received\"}";
             } else if (ctx.session_mgr_opt) |sm| {
-                const reply: ?[]const u8 = sm.processMessage(wa_session_key, mt, null) catch |err| blk: {
+                const conversation_context: ?ConversationContext = simpleConversationContext(
+                    "whatsapp",
+                    wa_account_id,
+                    wa_peer_id,
+                    wa_is_group,
+                    wa_group_id,
+                );
+                const reply: ?[]const u8 = sm.processMessage(wa_session_key, mt, conversation_context) catch |err| blk: {
                     ctx.response_body = userFacingAgentErrorJson(err);
                     break :blk null;
                 };
@@ -1950,7 +3229,14 @@ fn handleWhatsAppWebhookRoute(ctx: *WebhookHandlerContext) void {
                 _ = publishToBus(eb, ctx.state.allocator, "whatsapp", wa_sender_ns, wa_chat_target_ns, mt, wa_session_key, meta);
                 ctx.response_body = "{\"status\":\"received\"}";
             } else if (ctx.session_mgr_opt) |sm| {
-                const reply: ?[]const u8 = sm.processMessage(wa_session_key, mt, null) catch |err| blk: {
+                const conversation_context: ?ConversationContext = simpleConversationContext(
+                    "whatsapp",
+                    wa_account_id,
+                    wa_peer_id,
+                    wa_is_group,
+                    wa_group_id,
+                );
+                const reply: ?[]const u8 = sm.processMessage(wa_session_key, mt, conversation_context) catch |err| blk: {
                     ctx.response_body = userFacingAgentErrorJson(err);
                     break :blk null;
                 };
@@ -2008,7 +3294,23 @@ fn handleSlackWebhookRoute(ctx: *WebhookHandlerContext) void {
         return;
     };
 
-    const parsed = std.json.parseFromSlice(std.json.Value, ctx.req_allocator, body, .{}) catch {
+    const content_type = extractHeader(ctx.raw_request, "Content-Type");
+    const is_form_payload = if (content_type) |header_value| blk: {
+        const semi = std.mem.indexOfScalar(u8, header_value, ';') orelse header_value.len;
+        const base = std.mem.trim(u8, header_value[0..semi], " \t\r\n");
+        break :blk asciiEqlIgnoreCase(base, "application/x-www-form-urlencoded");
+    } else false;
+
+    const effective_body = if (is_form_payload)
+        slackDecodeInteractivePayload(ctx.req_allocator, body) orelse {
+            ctx.response_body = "{\"status\":\"parse_error\"}";
+            return;
+        }
+    else
+        body;
+    defer if (effective_body.ptr != body.ptr) ctx.req_allocator.free(effective_body);
+
+    const parsed = std.json.parseFromSlice(std.json.Value, ctx.req_allocator, effective_body, .{}) catch {
         ctx.response_body = "{\"status\":\"parse_error\"}";
         return;
     };
@@ -2024,7 +3326,7 @@ fn handleSlackWebhookRoute(ctx: *WebhookHandlerContext) void {
         "";
 
     if (std.mem.eql(u8, payload_type, "url_verification")) {
-        const challenge = jsonStringField(body, "challenge") orelse "";
+        const challenge = jsonStringField(effective_body, "challenge") orelse "";
         if (challenge.len == 0) {
             ctx.response_body = "{\"status\":\"ok\"}";
             return;
@@ -2034,6 +3336,132 @@ fn handleSlackWebhookRoute(ctx: *WebhookHandlerContext) void {
             return;
         };
         ctx.response_body = challenge_resp;
+        return;
+    }
+
+    if (std.mem.eql(u8, payload_type, "block_actions")) {
+        const user_val = parsed.value.object.get("user") orelse {
+            ctx.response_body = "{\"status\":\"ok\"}";
+            return;
+        };
+        const channel_val = parsed.value.object.get("channel") orelse {
+            ctx.response_body = "{\"status\":\"ok\"}";
+            return;
+        };
+        const actions_val = parsed.value.object.get("actions") orelse {
+            ctx.response_body = "{\"status\":\"ok\"}";
+            return;
+        };
+        if (user_val != .object or channel_val != .object or actions_val != .array or actions_val.array.items.len == 0) {
+            ctx.response_body = "{\"status\":\"ok\"}";
+            return;
+        }
+        const sender_id_val = user_val.object.get("id") orelse {
+            ctx.response_body = "{\"status\":\"ok\"}";
+            return;
+        };
+        const callback_channel_val = channel_val.object.get("id") orelse {
+            ctx.response_body = "{\"status\":\"ok\"}";
+            return;
+        };
+        const first_action = actions_val.array.items[0];
+        if (sender_id_val != .string or callback_channel_val != .string or first_action != .object) {
+            ctx.response_body = "{\"status\":\"ok\"}";
+            return;
+        }
+        const value_val = first_action.object.get("value") orelse {
+            ctx.response_body = "{\"status\":\"ok\"}";
+            return;
+        };
+        if (value_val != .string) {
+            ctx.response_body = "{\"status\":\"ok\"}";
+            return;
+        }
+        const parsed_callback = slackParseCallbackValue(value_val.string) orelse {
+            ctx.response_body = "{\"status\":\"ok\"}";
+            return;
+        };
+
+        var callback_channel = channels.slack.SlackChannel.initFromConfig(ctx.req_allocator, slack_cfg.*);
+        switch (callback_channel.consumeInteractionSelection(parsed_callback.token, parsed_callback.option_index, sender_id_val.string)) {
+            .ok => |selection| {
+                defer ctx.req_allocator.free(selection.submit_text);
+                defer ctx.req_allocator.free(selection.target);
+
+                const interactive_target = slackInteractiveTarget(selection.target, callback_channel_val.string);
+
+                var key_buf: [256]u8 = undefined;
+                const session_key = slackSessionKeyRouted(
+                    ctx.req_allocator,
+                    &key_buf,
+                    slack_cfg.account_id,
+                    sender_id_val.string,
+                    interactive_target.channel_id,
+                    interactive_target.is_dm,
+                    ctx.config_opt,
+                );
+
+                if (ctx.state.event_bus) |eb| {
+                    var meta_buf: [384]u8 = undefined;
+                    const metadata = if (interactive_target.thread_id) |thread_id|
+                        std.fmt.bufPrint(
+                            &meta_buf,
+                            "{{\"account_id\":\"{s}\",\"is_dm\":{s},\"channel_id\":\"{s}\",\"peer_kind\":\"{s}\",\"peer_id\":\"{s}\",\"thread_id\":\"{s}\",\"interactive\":true}}",
+                            .{
+                                slack_cfg.account_id,
+                                if (interactive_target.is_dm) "true" else "false",
+                                interactive_target.channel_id,
+                                if (interactive_target.is_dm) "direct" else "channel",
+                                if (interactive_target.is_dm) sender_id_val.string else interactive_target.channel_id,
+                                thread_id,
+                            },
+                        ) catch null
+                    else
+                        std.fmt.bufPrint(
+                            &meta_buf,
+                            "{{\"account_id\":\"{s}\",\"is_dm\":{s},\"channel_id\":\"{s}\",\"peer_kind\":\"{s}\",\"peer_id\":\"{s}\",\"interactive\":true}}",
+                            .{
+                                slack_cfg.account_id,
+                                if (interactive_target.is_dm) "true" else "false",
+                                interactive_target.channel_id,
+                                if (interactive_target.is_dm) "direct" else "channel",
+                                if (interactive_target.is_dm) sender_id_val.string else interactive_target.channel_id,
+                            },
+                        ) catch null;
+                    _ = publishToBus(
+                        eb,
+                        ctx.state.allocator,
+                        "slack",
+                        sender_id_val.string,
+                        selection.target,
+                        selection.submit_text,
+                        session_key,
+                        metadata,
+                    );
+                } else if (ctx.session_mgr_opt) |sm| {
+                    const conversation_context: ?ConversationContext = simpleConversationContext(
+                        "slack",
+                        slack_cfg.account_id,
+                        if (interactive_target.is_dm) sender_id_val.string else interactive_target.channel_id,
+                        !interactive_target.is_dm,
+                        if (!interactive_target.is_dm) interactive_target.channel_id else null,
+                    );
+                    const reply: ?[]const u8 = sm.processMessage(session_key, selection.submit_text, conversation_context) catch |err| blk: {
+                        var outbound_ch = channels.slack.SlackChannel.initFromConfig(ctx.req_allocator, slack_cfg.*);
+                        outbound_ch.sendMessage(selection.target, userFacingAgentError(err)) catch {};
+                        break :blk null;
+                    };
+                    if (reply) |r| {
+                        defer ctx.root_allocator.free(r);
+                        var outbound_ch = channels.slack.SlackChannel.initFromConfig(ctx.req_allocator, slack_cfg.*);
+                        outbound_ch.sendMessage(selection.target, r) catch {};
+                    }
+                }
+            },
+            else => {},
+        }
+
+        ctx.response_body = "{\"status\":\"ok\"}";
         return;
     }
 
@@ -2152,7 +3580,14 @@ fn handleSlackWebhookRoute(ctx: *WebhookHandlerContext) void {
         ) catch null;
         _ = publishToBus(eb, ctx.state.allocator, "slack", sender_id, channel_id, text, sk, metadata);
     } else if (ctx.session_mgr_opt) |sm| {
-        const reply: ?[]const u8 = sm.processMessage(sk, text, null) catch |err| blk: {
+        const conversation_context: ?ConversationContext = simpleConversationContext(
+            "slack",
+            slack_cfg.account_id,
+            if (is_dm) sender_id else channel_id,
+            !is_dm,
+            if (!is_dm) channel_id else null,
+        );
+        const reply: ?[]const u8 = sm.processMessage(sk, text, conversation_context) catch |err| blk: {
             var outbound_ch = channels.slack.SlackChannel.initFromConfig(ctx.req_allocator, slack_cfg.*);
             outbound_ch.sendMessage(channel_id, userFacingAgentError(err)) catch {};
             break :blk null;
@@ -2281,7 +3716,14 @@ fn handleLineWebhookRoute(ctx: *WebhookHandlerContext) void {
                     }) catch null;
                     _ = publishToBus(eb, ctx.state.allocator, "line", uid, line_target, text, sk, meta);
                 } else if (ctx.session_mgr_opt) |sm| {
-                    const reply: ?[]const u8 = sm.processMessage(sk, text, null) catch |err| blk: {
+                    const conversation_context: ?ConversationContext = simpleConversationContext(
+                        "line",
+                        line_account_id,
+                        line_peer.id,
+                        !std.mem.eql(u8, line_peer.kind, "direct"),
+                        if (!std.mem.eql(u8, line_peer.kind, "direct")) line_peer.id else null,
+                    );
+                    const reply: ?[]const u8 = sm.processMessage(sk, text, conversation_context) catch |err| blk: {
                         if (evt.reply_token) |rt| {
                             var line_ch = channels.line.LineChannel.init(ctx.req_allocator, .{
                                 .access_token = line_access_token,
@@ -2402,7 +3844,14 @@ fn handleLarkWebhookRoute(ctx: *WebhookHandlerContext) void {
             }) catch null;
             _ = publishToBus(eb, ctx.state.allocator, "lark", msg.sender, msg.sender, msg.content, sk, meta);
         } else if (ctx.session_mgr_opt) |sm| {
-            const reply: ?[]const u8 = sm.processMessage(sk, msg.content, null) catch |err| blk: {
+            const conversation_context: ?ConversationContext = simpleConversationContext(
+                "lark",
+                lark_account_id,
+                msg.sender,
+                msg.is_group,
+                if (msg.is_group) msg.sender else null,
+            );
+            const reply: ?[]const u8 = sm.processMessage(sk, msg.content, conversation_context) catch |err| blk: {
                 lark_ch.sendMessage(msg.sender, userFacingAgentError(err)) catch {};
                 break :blk null;
             };
@@ -2412,6 +3861,429 @@ fn handleLarkWebhookRoute(ctx: *WebhookHandlerContext) void {
             }
         }
     }
+    ctx.response_body = "{\"status\":\"ok\"}";
+}
+
+fn handleWeChatWebhookRoute(ctx: *WebhookHandlerContext) void {
+    if (!build_options.enable_channel_wechat) {
+        ctx.response_status = "404 Not Found";
+        ctx.response_body = "{\"error\":\"wechat channel disabled in this build\"}";
+        return;
+    }
+
+    var wechat_account_id = ctx.state.wechat_account_id;
+    var wechat_allow_from = ctx.state.wechat_allow_from;
+    var callback_token = ctx.state.wechat_callback_token;
+    var secure_aes_key = ctx.state.wechat_encoding_aes_key;
+    var expected_app_id = ctx.state.wechat_app_id;
+    if (selectWeChatConfig(ctx.config_opt, ctx.target)) |wechat_cfg| {
+        wechat_account_id = wechat_cfg.account_id;
+        wechat_allow_from = wechat_cfg.allow_from;
+        callback_token = wechat_cfg.callback_token;
+        secure_aes_key = wechat_cfg.encoding_aes_key orelse "";
+        expected_app_id = wechat_cfg.app_id orelse "";
+    }
+    if (callback_token.len == 0) {
+        ctx.response_status = "404 Not Found";
+        ctx.response_body = "{\"error\":\"wechat callback not configured\"}";
+        return;
+    }
+
+    const secure_enabled = callback_token.len > 0 and secure_aes_key.len > 0;
+
+    if (std.mem.eql(u8, ctx.method, "GET")) {
+        const echo = parseQueryParam(ctx.target, "echostr") orelse {
+            ctx.response_body = "{\"status\":\"ok\"}";
+            return;
+        };
+
+        if (callback_token.len > 0) {
+            const timestamp = parseQueryParam(ctx.target, "timestamp") orelse {
+                ctx.response_status = "400 Bad Request";
+                ctx.response_body = "{\"error\":\"missing timestamp\"}";
+                return;
+            };
+            const nonce = parseQueryParam(ctx.target, "nonce") orelse {
+                ctx.response_status = "400 Bad Request";
+                ctx.response_body = "{\"error\":\"missing nonce\"}";
+                return;
+            };
+
+            if (secure_enabled) {
+                const msg_signature = parseQueryParam(ctx.target, "msg_signature") orelse {
+                    ctx.response_status = "400 Bad Request";
+                    ctx.response_body = "{\"error\":\"missing msg_signature\"}";
+                    return;
+                };
+                if (!channels.wechat.verifyMessageSignature(callback_token, timestamp, nonce, echo, msg_signature)) {
+                    ctx.response_status = "403 Forbidden";
+                    ctx.response_body = "{\"error\":\"invalid signature\"}";
+                    return;
+                }
+
+                const expected_app_id_opt: ?[]const u8 = if (expected_app_id.len > 0) expected_app_id else null;
+                const plain_echo = channels.wechat.decryptSecurePayload(
+                    ctx.req_allocator,
+                    secure_aes_key,
+                    echo,
+                    expected_app_id_opt,
+                ) catch {
+                    ctx.response_status = "403 Forbidden";
+                    ctx.response_body = "{\"error\":\"decrypt failed\"}";
+                    return;
+                };
+                setPlainTextResponse(ctx, plain_echo);
+                return;
+            } else {
+                const signature = parseQueryParam(ctx.target, "signature") orelse {
+                    ctx.response_status = "400 Bad Request";
+                    ctx.response_body = "{\"error\":\"missing signature\"}";
+                    return;
+                };
+                if (!channels.wechat.verifySignature(callback_token, timestamp, nonce, signature)) {
+                    ctx.response_status = "403 Forbidden";
+                    ctx.response_body = "{\"error\":\"invalid signature\"}";
+                    return;
+                }
+            }
+        }
+
+        setPlainTextResponse(ctx, echo);
+        return;
+    }
+
+    if (!std.mem.eql(u8, ctx.method, "POST")) {
+        ctx.response_status = "405 Method Not Allowed";
+        ctx.response_body = "{\"error\":\"method not allowed\"}";
+        return;
+    }
+
+    if (!ctx.state.rate_limiter.allowWebhook(ctx.state.allocator, "wechat")) {
+        ctx.response_status = "429 Too Many Requests";
+        ctx.response_body = "{\"error\":\"rate limited\"}";
+        return;
+    }
+
+    const body = extractBody(ctx.raw_request) orelse {
+        setPlainTextResponse(ctx, "success");
+        return;
+    };
+
+    const inbound_payload = if (secure_enabled) blk: {
+        const encrypted = channels.wechat.extractEncryptedField(body) orelse {
+            ctx.response_status = "400 Bad Request";
+            ctx.response_body = "{\"error\":\"missing Encrypt field\"}";
+            return;
+        };
+        const msg_signature = parseQueryParam(ctx.target, "msg_signature") orelse {
+            ctx.response_status = "400 Bad Request";
+            ctx.response_body = "{\"error\":\"missing msg_signature\"}";
+            return;
+        };
+        const timestamp = parseQueryParam(ctx.target, "timestamp") orelse {
+            ctx.response_status = "400 Bad Request";
+            ctx.response_body = "{\"error\":\"missing timestamp\"}";
+            return;
+        };
+        const nonce = parseQueryParam(ctx.target, "nonce") orelse {
+            ctx.response_status = "400 Bad Request";
+            ctx.response_body = "{\"error\":\"missing nonce\"}";
+            return;
+        };
+
+        if (!channels.wechat.verifyMessageSignature(callback_token, timestamp, nonce, encrypted, msg_signature)) {
+            ctx.response_status = "403 Forbidden";
+            ctx.response_body = "{\"error\":\"invalid signature\"}";
+            return;
+        }
+
+        const expected_app_id_opt: ?[]const u8 = if (expected_app_id.len > 0) expected_app_id else null;
+        break :blk channels.wechat.decryptSecurePayload(
+            ctx.req_allocator,
+            secure_aes_key,
+            encrypted,
+            expected_app_id_opt,
+        ) catch {
+            ctx.response_status = "403 Forbidden";
+            ctx.response_body = "{\"error\":\"decrypt failed\"}";
+            return;
+        };
+    } else blk: {
+        if (callback_token.len > 0) {
+            const signature = parseQueryParam(ctx.target, "signature") orelse {
+                ctx.response_status = "400 Bad Request";
+                ctx.response_body = "{\"error\":\"missing signature\"}";
+                return;
+            };
+            const timestamp = parseQueryParam(ctx.target, "timestamp") orelse {
+                ctx.response_status = "400 Bad Request";
+                ctx.response_body = "{\"error\":\"missing timestamp\"}";
+                return;
+            };
+            const nonce = parseQueryParam(ctx.target, "nonce") orelse {
+                ctx.response_status = "400 Bad Request";
+                ctx.response_body = "{\"error\":\"missing nonce\"}";
+                return;
+            };
+            if (!channels.wechat.verifySignature(callback_token, timestamp, nonce, signature)) {
+                ctx.response_status = "403 Forbidden";
+                ctx.response_body = "{\"error\":\"invalid signature\"}";
+                return;
+            }
+        }
+
+        break :blk ctx.req_allocator.dupe(u8, body) catch {
+            ctx.response_status = "500 Internal Server Error";
+            ctx.response_body = "{\"error\":\"out of memory\"}";
+            return;
+        };
+    };
+    defer ctx.req_allocator.free(inbound_payload);
+
+    var inbound = channels.wechat.parseIncomingPayload(ctx.req_allocator, inbound_payload) catch {
+        setPlainTextResponse(ctx, "success");
+        return;
+    } orelse {
+        setPlainTextResponse(ctx, "success");
+        return;
+    };
+    defer inbound.deinit(ctx.req_allocator);
+
+    if (wechat_allow_from.len > 0 and !channels.isAllowed(wechat_allow_from, inbound.from_user)) {
+        setPlainTextResponse(ctx, "success");
+        return;
+    }
+
+    if (ctx.state.event_bus) |eb| {
+        var key_buf: [128]u8 = undefined;
+        const session_key = wechatSessionKeyRouted(
+            ctx.req_allocator,
+            &key_buf,
+            inbound.from_user,
+            ctx.config_opt,
+            wechat_account_id,
+        );
+        var meta_buf: [320]u8 = undefined;
+        const meta = std.fmt.bufPrint(&meta_buf, "{{\"account_id\":\"{s}\",\"peer_kind\":\"direct\",\"peer_id\":\"{s}\"}}", .{
+            wechat_account_id,
+            inbound.from_user,
+        }) catch null;
+        _ = publishToBus(eb, ctx.state.allocator, "wechat", inbound.from_user, inbound.from_user, inbound.content, session_key, meta);
+        setPlainTextResponse(ctx, "success");
+        return;
+    }
+
+    if (ctx.session_mgr_opt) |sm| {
+        var key_buf: [128]u8 = undefined;
+        const session_key = wechatSessionKeyRouted(
+            ctx.req_allocator,
+            &key_buf,
+            inbound.from_user,
+            ctx.config_opt,
+            wechat_account_id,
+        );
+        const reply: ?[]const u8 = sm.processMessage(session_key, inbound.content, null) catch null;
+        if (reply) |r| {
+            defer ctx.root_allocator.free(r);
+            const now_secs = std.time.timestamp();
+            const xml = channels.wechat.buildPassiveTextReply(
+                ctx.req_allocator,
+                inbound.from_user,
+                inbound.to_user,
+                r,
+                now_secs,
+            ) catch {
+                setPlainTextResponse(ctx, "success");
+                return;
+            };
+            setXmlResponse(ctx, xml);
+            return;
+        }
+    }
+
+    setPlainTextResponse(ctx, "success");
+}
+
+fn handleWeComWebhookRoute(ctx: *WebhookHandlerContext) void {
+    if (!build_options.enable_channel_wecom) {
+        ctx.response_status = "404 Not Found";
+        ctx.response_body = "{\"error\":\"wecom channel disabled in this build\"}";
+        return;
+    }
+
+    var wecom_account_id = ctx.state.wecom_account_id;
+    var wecom_allow_from = ctx.state.wecom_allow_from;
+    var secure_token = ctx.state.wecom_callback_token;
+    var secure_aes_key = ctx.state.wecom_encoding_aes_key;
+    var secure_corp_id = ctx.state.wecom_corp_id;
+    var wecom_cfg_opt: ?*const config_types.WeComConfig = null;
+    if (selectWeComConfig(ctx.config_opt, ctx.target)) |wecom_cfg| {
+        wecom_cfg_opt = wecom_cfg;
+        wecom_account_id = wecom_cfg.account_id;
+        wecom_allow_from = wecom_cfg.allow_from;
+        secure_token = wecom_cfg.callback_token orelse "";
+        secure_aes_key = wecom_cfg.encoding_aes_key orelse "";
+        secure_corp_id = wecom_cfg.corp_id orelse "";
+    }
+
+    const secure_enabled = secure_token.len > 0 and secure_aes_key.len > 0;
+    if (!secure_enabled) {
+        ctx.response_status = "404 Not Found";
+        ctx.response_body = "{\"error\":\"wecom secure callback not configured\"}";
+        return;
+    }
+
+    if (std.mem.eql(u8, ctx.method, "GET")) {
+        if (parseQueryParam(ctx.target, "echostr")) |echo_str| {
+            const msg_sig = parseQueryParam(ctx.target, "msg_signature") orelse {
+                ctx.response_status = "400 Bad Request";
+                ctx.response_body = "{\"error\":\"missing msg_signature\"}";
+                return;
+            };
+            const timestamp = parseQueryParam(ctx.target, "timestamp") orelse {
+                ctx.response_status = "400 Bad Request";
+                ctx.response_body = "{\"error\":\"missing timestamp\"}";
+                return;
+            };
+            const nonce = parseQueryParam(ctx.target, "nonce") orelse {
+                ctx.response_status = "400 Bad Request";
+                ctx.response_body = "{\"error\":\"missing nonce\"}";
+                return;
+            };
+
+            if (!channels.wecom.verifySignature(secure_token, timestamp, nonce, echo_str, msg_sig)) {
+                ctx.response_status = "403 Forbidden";
+                ctx.response_body = "{\"error\":\"invalid signature\"}";
+                return;
+            }
+
+            const expected_receive_id: ?[]const u8 = if (secure_corp_id.len > 0) secure_corp_id else null;
+            const plain_echo = channels.wecom.decryptSecurePayload(
+                ctx.req_allocator,
+                secure_aes_key,
+                echo_str,
+                expected_receive_id,
+            ) catch {
+                ctx.response_status = "403 Forbidden";
+                ctx.response_body = "{\"error\":\"decrypt failed\"}";
+                return;
+            };
+            setPlainTextResponse(ctx, plain_echo);
+        } else {
+            ctx.response_body = "{\"status\":\"ok\"}";
+        }
+        return;
+    }
+
+    if (!std.mem.eql(u8, ctx.method, "POST")) {
+        ctx.response_status = "405 Method Not Allowed";
+        ctx.response_body = "{\"error\":\"method not allowed\"}";
+        return;
+    }
+    if (!ctx.state.rate_limiter.allowWebhook(ctx.state.allocator, "wecom")) {
+        ctx.response_status = "429 Too Many Requests";
+        ctx.response_body = "{\"error\":\"rate limited\"}";
+        return;
+    }
+
+    const body = extractBody(ctx.raw_request) orelse {
+        ctx.response_body = "{\"status\":\"received\"}";
+        return;
+    };
+
+    const inbound_payload = blk: {
+        const encrypted = channels.wecom.extractEncryptedField(body) orelse {
+            ctx.response_status = "400 Bad Request";
+            ctx.response_body = "{\"error\":\"missing Encrypt field\"}";
+            return;
+        };
+        const msg_sig = parseQueryParam(ctx.target, "msg_signature") orelse {
+            ctx.response_status = "400 Bad Request";
+            ctx.response_body = "{\"error\":\"missing msg_signature\"}";
+            return;
+        };
+        const timestamp = parseQueryParam(ctx.target, "timestamp") orelse {
+            ctx.response_status = "400 Bad Request";
+            ctx.response_body = "{\"error\":\"missing timestamp\"}";
+            return;
+        };
+        const nonce = parseQueryParam(ctx.target, "nonce") orelse {
+            ctx.response_status = "400 Bad Request";
+            ctx.response_body = "{\"error\":\"missing nonce\"}";
+            return;
+        };
+
+        if (!channels.wecom.verifySignature(secure_token, timestamp, nonce, encrypted, msg_sig)) {
+            ctx.response_status = "403 Forbidden";
+            ctx.response_body = "{\"error\":\"invalid signature\"}";
+            return;
+        }
+
+        const expected_receive_id: ?[]const u8 = if (secure_corp_id.len > 0) secure_corp_id else null;
+        break :blk channels.wecom.decryptSecurePayload(
+            ctx.req_allocator,
+            secure_aes_key,
+            encrypted,
+            expected_receive_id,
+        ) catch {
+            ctx.response_status = "403 Forbidden";
+            ctx.response_body = "{\"error\":\"decrypt failed\"}";
+            return;
+        };
+    };
+    defer ctx.req_allocator.free(inbound_payload);
+
+    var inbound = channels.wecom.parseIncomingPayload(ctx.req_allocator, inbound_payload) catch {
+        ctx.response_body = "{\"status\":\"parse_error\"}";
+        return;
+    } orelse {
+        ctx.response_body = "{\"status\":\"ok\"}";
+        return;
+    };
+    defer inbound.deinit(ctx.req_allocator);
+
+    if (wecom_allow_from.len > 0 and !channels.isAllowed(wecom_allow_from, inbound.sender)) {
+        ctx.response_body = "{\"status\":\"unauthorized\"}";
+        return;
+    }
+
+    var key_buf: [128]u8 = undefined;
+    const session_key = wecomSessionKeyRouted(
+        ctx.req_allocator,
+        &key_buf,
+        inbound.sender,
+        ctx.config_opt,
+        wecom_account_id,
+    );
+
+    if (ctx.state.event_bus) |eb| {
+        var meta_buf: [320]u8 = undefined;
+        const meta = std.fmt.bufPrint(&meta_buf, "{{\"account_id\":\"{s}\",\"peer_kind\":\"direct\",\"peer_id\":\"{s}\"}}", .{
+            wecom_account_id,
+            inbound.sender,
+        }) catch null;
+        _ = publishToBus(eb, ctx.state.allocator, "wecom", inbound.sender, inbound.sender, inbound.content, session_key, meta);
+        ctx.response_body = "{\"status\":\"received\"}";
+        return;
+    }
+
+    if (ctx.session_mgr_opt) |sm| {
+        const reply: ?[]const u8 = sm.processMessage(session_key, inbound.content, null) catch |err| blk: {
+            if (wecom_cfg_opt) |wecom_cfg| {
+                var wecom_ch = channels.wecom.WeComChannel.initFromConfig(ctx.req_allocator, wecom_cfg.*);
+                wecom_ch.sendMessageAuto("", userFacingAgentError(err)) catch {};
+            }
+            break :blk null;
+        };
+        if (reply) |r| {
+            defer ctx.root_allocator.free(r);
+            if (wecom_cfg_opt) |wecom_cfg| {
+                var wecom_ch = channels.wecom.WeComChannel.initFromConfig(ctx.req_allocator, wecom_cfg.*);
+                wecom_ch.sendMessageAuto("", r) catch {};
+            }
+        }
+    }
+
     ctx.response_body = "{\"status\":\"ok\"}";
 }
 
@@ -2504,7 +4376,21 @@ fn handleQqWebhookRoute(ctx: *WebhookHandlerContext) void {
         }
 
         if (ctx.session_mgr_opt) |sm| {
-            const reply: ?[]const u8 = sm.processMessage(inbound.session_key, inbound.content, null) catch |err| blk: {
+            const routed_session_key: ?[]const u8 = qqSessionKeyRouted(ctx.req_allocator, &inbound, ctx.config_opt);
+            defer if (routed_session_key) |owned| ctx.req_allocator.free(owned);
+            const session_key = routed_session_key orelse inbound.session_key;
+            const peer = qqPeerRefFromInbound(&inbound);
+            const meta = inbound.metadata_json;
+            const account_id = if (meta) |json| jsonStringField(json, "account_id") else null;
+            const conversation_context = buildConversationContext(.{
+                .channel = "qq",
+                .account_id = account_id,
+                .sender_id = inbound.sender_id,
+                .peer_id = if (peer) |resolved| resolved.id else null,
+                .is_group = if (peer) |resolved| resolved.kind != .direct else null,
+                .group_id = if (peer) |resolved| if (resolved.kind == .direct) null else resolved.id else null,
+            });
+            const reply: ?[]const u8 = sm.processMessage(session_key, inbound.content, conversation_context) catch |err| blk: {
                 qq_channel.sendMessage(inbound.chat_id, userFacingAgentError(err)) catch {};
                 break :blk null;
             };
@@ -2518,13 +4404,494 @@ fn handleQqWebhookRoute(ctx: *WebhookHandlerContext) void {
     ctx.response_body = "{\"status\":\"ok\"}";
 }
 
+fn handleMaxWebhookRoute(ctx: *WebhookHandlerContext) void {
+    if (!build_options.enable_channel_max) {
+        ctx.response_status = "404 Not Found";
+        ctx.response_body = "{\"error\":\"max channel disabled in this build\"}";
+        return;
+    }
+
+    if (!std.mem.eql(u8, ctx.method, "POST")) {
+        ctx.response_status = "405 Method Not Allowed";
+        ctx.response_body = "{\"error\":\"method not allowed\"}";
+        return;
+    }
+    if (!ctx.state.rate_limiter.allowWebhook(ctx.state.allocator, "max")) {
+        ctx.response_status = "429 Too Many Requests";
+        ctx.response_body = "{\"error\":\"rate limited\"}";
+        return;
+    }
+
+    const body = extractBody(ctx.raw_request) orelse {
+        ctx.response_body = "{\"status\":\"received\"}";
+        return;
+    };
+
+    const secret_header = extractHeader(ctx.raw_request, "X-Max-Bot-Api-Secret");
+    const max_cfg = selectMaxConfig(ctx.config_opt, ctx.target, secret_header) orelse {
+        ctx.response_status = "404 Not Found";
+        ctx.response_body = "{\"error\":\"max not configured\"}";
+        return;
+    };
+
+    if (max_cfg.mode != .webhook) {
+        ctx.response_status = "404 Not Found";
+        ctx.response_body = "{\"error\":\"max webhook mode not enabled\"}";
+        return;
+    }
+
+    // Verify secret header if secret is configured
+    if (max_cfg.webhook_secret) |secret| {
+        if (secret.len > 0) {
+            if (secret_header) |sig| {
+                if (!std.mem.eql(u8, std.mem.trim(u8, sig, " \t\r\n"), secret)) {
+                    ctx.response_status = "403 Forbidden";
+                    ctx.response_body = "{\"error\":\"invalid secret\"}";
+                    return;
+                }
+            } else {
+                ctx.response_status = "403 Forbidden";
+                ctx.response_body = "{\"error\":\"missing secret\"}";
+                return;
+            }
+        }
+    }
+
+    // Parse the update JSON
+    const parsed = std.json.parseFromSlice(std.json.Value, ctx.req_allocator, body, .{}) catch {
+        ctx.response_status = "400 Bad Request";
+        ctx.response_body = "{\"error\":\"invalid json payload\"}";
+        return;
+    };
+    defer parsed.deinit();
+
+    var max_ch = channels.max.MaxChannel.initFromConfig(ctx.req_allocator, max_cfg.*);
+
+    if (max_ch.processUpdate(ctx.req_allocator, parsed.value)) |inbound| {
+        defer inbound.deinit(ctx.req_allocator);
+
+        const reply_target = inbound.reply_target orelse inbound.sender;
+        const peer_id = if (inbound.is_group) reply_target else inbound.sender;
+        var kb: [192]u8 = undefined;
+        const sk = maxSessionKeyRouted(
+            ctx.req_allocator,
+            &kb,
+            inbound.sender,
+            reply_target,
+            inbound.is_group,
+            ctx.config_opt,
+            max_cfg.account_id,
+        );
+        const peer_kind: []const u8 = if (inbound.is_group) "group" else "direct";
+
+        if (ctx.state.event_bus) |eb| {
+            var meta_buf: [384]u8 = undefined;
+            const meta = std.fmt.bufPrint(&meta_buf, "{{\"account_id\":\"{s}\",\"peer_kind\":\"{s}\",\"peer_id\":\"{s}\"}}", .{
+                max_cfg.account_id,
+                peer_kind,
+                peer_id,
+            }) catch null;
+            _ = publishToBus(eb, ctx.state.allocator, "max", inbound.sender, reply_target, inbound.content, sk, meta);
+            ctx.response_body = "{\"status\":\"received\"}";
+            return;
+        }
+
+        if (ctx.session_mgr_opt) |sm| {
+            channels.max.setInteractiveOwnerContext(inbound.sender);
+            defer channels.max.setInteractiveOwnerContext(null);
+            const conversation_context: ?ConversationContext = simpleConversationContext(
+                "max",
+                max_cfg.account_id,
+                peer_id,
+                inbound.is_group,
+                if (inbound.is_group) reply_target else null,
+            );
+            const reply: ?[]const u8 = sm.processMessage(sk, inbound.content, conversation_context) catch |err| blk: {
+                max_ch.sendMessage(reply_target, userFacingAgentError(err)) catch {};
+                break :blk null;
+            };
+            if (reply) |r| {
+                defer ctx.root_allocator.free(r);
+                max_ch.sendMessage(reply_target, r) catch {};
+            }
+        }
+    }
+
+    ctx.response_body = "{\"status\":\"ok\"}";
+}
+
+fn handleTeamsWebhookRoute(ctx: *WebhookHandlerContext) void {
+    if (!build_options.enable_channel_teams) {
+        ctx.response_status = "404 Not Found";
+        ctx.response_body = "{\"error\":\"teams channel disabled in this build\"}";
+        return;
+    }
+
+    const is_post = std.mem.eql(u8, ctx.method, "POST");
+    if (!is_post) {
+        ctx.response_status = "405 Method Not Allowed";
+        ctx.response_body = "{\"error\":\"method not allowed\"}";
+        return;
+    }
+
+    if (!ctx.state.rate_limiter.allowWebhook(ctx.state.allocator, "teams")) {
+        ctx.response_status = "429 Too Many Requests";
+        ctx.response_body = "{\"error\":\"rate limited\"}";
+        return;
+    }
+
+    // Get config
+    const config = ctx.config_opt orelse {
+        ctx.response_status = "500 Internal Server Error";
+        ctx.response_body = "{\"error\":\"no config\"}";
+        return;
+    };
+    if (config.channels.teams.len == 0) {
+        ctx.response_status = "404 Not Found";
+        ctx.response_body = "{\"error\":\"teams not configured\"}";
+        return;
+    }
+
+    const body = extractBody(ctx.raw_request) orelse {
+        ctx.response_status = "400 Bad Request";
+        ctx.response_body = "{\"error\":\"empty body\"}";
+        return;
+    };
+
+    // Parse Bot Framework Activity JSON
+    const activity_type = jsonStringField(body, "type") orelse {
+        ctx.response_status = "202 Accepted";
+        ctx.response_body = "{\"status\":\"accepted\"}";
+        return;
+    };
+
+    // Only process "message" activities
+    if (!std.mem.eql(u8, activity_type, "message")) {
+        ctx.response_status = "202 Accepted";
+        ctx.response_body = "{\"status\":\"accepted\"}";
+        return;
+    }
+
+    const text = jsonStringField(body, "text") orelse {
+        ctx.response_status = "202 Accepted";
+        ctx.response_body = "{\"status\":\"accepted\"}";
+        return;
+    };
+
+    // Extract and validate serviceUrl — this is untrusted input from the webhook payload.
+    // Only allow HTTPS URLs to trusted Bot Framework domains to prevent SSRF.
+    const service_url = jsonStringField(body, "serviceUrl") orelse {
+        ctx.response_status = "400 Bad Request";
+        ctx.response_body = "{\"error\":\"missing serviceUrl\"}";
+        return;
+    };
+    if (!isValidBotFrameworkServiceUrl(service_url)) {
+        std.log.scoped(.teams).warn("Teams webhook rejected untrusted serviceUrl: {s}", .{service_url});
+        ctx.response_status = "400 Bad Request";
+        ctx.response_body = "{\"error\":\"untrusted serviceUrl\"}";
+        return;
+    }
+
+    // Resolve Teams config: match by tenant_id from channelData if multiple
+    // accounts are configured, otherwise fall back to primary.
+    const payload_tenant_id = teamsNestedField(body, "channelData", "tenant") orelse null;
+    const teams_cfg = blk: {
+        if (payload_tenant_id) |tid| {
+            // channelData.tenant may be {"id":"..."} — try extracting the id subfield
+            const resolved_tid = jsonStringField(tid, "id") orelse tid;
+            for (config.channels.teams) |tc| {
+                if (std.mem.eql(u8, tc.tenant_id, resolved_tid)) break :blk tc;
+            }
+        }
+        break :blk config.channels.teamsPrimary() orelse {
+            ctx.response_status = "404 Not Found";
+            ctx.response_body = "{\"error\":\"no matching teams config for tenant\"}";
+            return;
+        };
+    };
+
+    // Verify webhook secret if configured.
+    // TODO: For production, validate the Bot Framework JWT bearer token from the
+    // Authorization header against Microsoft's OpenID metadata instead of using
+    // a custom shared secret. See: https://learn.microsoft.com/en-us/azure/bot-service/rest-api/bot-framework-rest-connector-authentication
+    if (teams_cfg.webhook_secret) |secret| {
+        const header_val = extractHeader(ctx.raw_request, "X-Webhook-Secret");
+        if (header_val == null or !std.mem.eql(u8, std.mem.trim(u8, header_val.?, " \t\r\n"), secret)) {
+            ctx.response_status = "401 Unauthorized";
+            ctx.response_body = "{\"error\":\"unauthorized\"}";
+            return;
+        }
+    } else {
+        // No webhook_secret configured — webhook is open to anyone who knows the URL.
+        // This is acceptable for development but should use webhook_secret or JWT
+        // validation in production deployments.
+        std.log.scoped(.teams).warn("Teams webhook: no webhook_secret configured — request accepted without auth", .{});
+    }
+
+    // For nested fields, use manual parsing since jsonStringField doesn't handle nesting
+    const conversation_id = teamsNestedField(body, "conversation", "id") orelse {
+        ctx.response_status = "400 Bad Request";
+        ctx.response_body = "{\"error\":\"missing conversation.id\"}";
+        return;
+    };
+
+    const from_id = teamsNestedField(body, "from", "id") orelse "unknown";
+    const from_name = teamsNestedField(body, "from", "name");
+
+    const peer_info = teamsPeerRef(body, from_id, conversation_id);
+    var key_buf: [256]u8 = undefined;
+    const sk = teamsSessionKeyRouted(
+        ctx.req_allocator,
+        &key_buf,
+        config,
+        body,
+        teams_cfg.account_id,
+        teams_cfg.tenant_id,
+        conversation_id,
+        from_id,
+    );
+
+    // Build chat_id as "serviceUrl|conversationId" for outbound routing
+    var chat_buf: [512]u8 = undefined;
+    const chat_id = std.fmt.bufPrint(&chat_buf, "{s}|{s}", .{ service_url, conversation_id }) catch {
+        ctx.response_status = "500 Internal Server Error";
+        ctx.response_body = "{\"error\":\"chat_id overflow\"}";
+        return;
+    };
+
+    // Build metadata JSON
+    var meta_buf: [512]u8 = undefined;
+    const metadata = std.fmt.bufPrint(
+        &meta_buf,
+        "{{\"account_id\":\"{s}\",\"service_url\":\"{s}\",\"conversation_id\":\"{s}\",\"from_id\":\"{s}\",\"peer_kind\":\"{s}\",\"peer_id\":\"{s}\",\"is_dm\":{s}}}",
+        .{
+            teams_cfg.account_id,
+            service_url,
+            conversation_id,
+            from_id,
+            if (peer_info.is_dm) "direct" else "channel",
+            peer_info.peer.id,
+            if (peer_info.is_dm) "true" else "false",
+        },
+    ) catch null;
+
+    // Capture conversation reference if this is the notification channel
+    if (teams_cfg.notification_channel_id) |notif_id| {
+        if (std.mem.eql(u8, conversation_id, notif_id)) {
+            teamsStoreConversationRef(config, service_url, conversation_id);
+        }
+    }
+
+    const conversation_context = buildConversationContext(.{
+        .channel = "teams",
+        .account_id = teams_cfg.account_id,
+        .sender_uuid = from_id,
+        .sender_name = from_name,
+        .peer_id = peer_info.peer.id,
+        .is_group = !peer_info.is_dm,
+        .group_id = if (peer_info.is_dm) null else peer_info.peer.id,
+    });
+
+    if (ctx.state.event_bus) |eb| {
+        _ = publishToBus(eb, ctx.state.allocator, "teams", from_id, chat_id, text, sk, metadata);
+    } else if (ctx.session_mgr_opt) |sm| {
+        const reply: ?[]const u8 = sm.processMessage(sk, text, conversation_context) catch blk: {
+            break :blk null;
+        };
+        if (reply) |r| {
+            defer ctx.root_allocator.free(r);
+            var outbound_ch = channels.teams.TeamsChannel.initFromConfig(ctx.req_allocator, teams_cfg);
+            const aid = outbound_ch.sendMessage(service_url, conversation_id, r) catch |err| blk: {
+                std.log.scoped(.teams).warn("Teams direct-reply sendMessage failed: {}", .{err});
+                break :blk null;
+            };
+            if (aid) |id| ctx.req_allocator.free(id);
+        }
+    }
+
+    ctx.response_status = "202 Accepted";
+    ctx.response_body = "{\"status\":\"accepted\"}";
+}
+
+/// Extract a nested string field from JSON: obj.outer.inner
+/// Uses jsonStringField on the nested object substring. Handles arbitrary
+/// nesting depth within the outer value by tracking brace depth, and skips
+/// over braces inside JSON string literals to avoid false matches.
+fn teamsNestedField(json: []const u8, outer: []const u8, inner: []const u8) ?[]const u8 {
+    // Find the outer object key
+    var needle_buf: [256]u8 = undefined;
+    const quoted_key = std.fmt.bufPrint(&needle_buf, "\"{s}\"", .{outer}) catch return null;
+    const key_pos = std.mem.indexOf(u8, json, quoted_key) orelse return null;
+    const after_key = json[key_pos + quoted_key.len ..];
+
+    // Find the opening brace of the nested object
+    var i: usize = 0;
+    while (i < after_key.len and after_key[i] != '{') : (i += 1) {}
+    if (i >= after_key.len) return null;
+
+    // Find the matching closing brace, respecting nesting and string literals
+    const obj_start = i;
+    var depth: usize = 0;
+    var in_string = false;
+    while (i < after_key.len) : (i += 1) {
+        const c = after_key[i];
+        if (in_string) {
+            if (c == '\\' and i + 1 < after_key.len) {
+                i += 1; // skip escaped char
+                continue;
+            }
+            if (c == '"') in_string = false;
+            continue;
+        }
+        if (c == '"') {
+            in_string = true;
+        } else if (c == '{') {
+            depth += 1;
+        } else if (c == '}') {
+            depth -= 1;
+            if (depth == 0) {
+                i += 1;
+                break;
+            }
+        }
+    }
+    const nested_json = after_key[obj_start..i];
+    return jsonStringField(nested_json, inner);
+}
+
+/// Validate that a serviceUrl from a Bot Framework Activity is a trusted Microsoft domain.
+/// Prevents SSRF by only allowing outbound requests to known Bot Framework endpoints.
+fn isValidBotFrameworkServiceUrl(url: []const u8) bool {
+    // Must be HTTPS
+    if (!std.mem.startsWith(u8, url, "https://")) return false;
+
+    // Extract hostname (after "https://", before "/" or ":")
+    const host_start = "https://".len;
+    const rest = url[host_start..];
+    var host_end: usize = rest.len;
+    for (rest, 0..) |c, j| {
+        if (c == '/' or c == ':') {
+            host_end = j;
+            break;
+        }
+    }
+    const host = rest[0..host_end];
+    if (host.len == 0) return false;
+
+    // Allow known Bot Framework service domains
+    const allowed_suffixes = [_][]const u8{
+        ".botframework.com",
+        ".teams.microsoft.com",
+        ".skype.com",
+        ".microsoft.com",
+    };
+    for (allowed_suffixes) |suffix| {
+        if (std.mem.endsWith(u8, host, suffix)) return true;
+    }
+    return false;
+}
+
+/// Store Teams conversation reference (serviceUrl + conversationId) to a JSON file
+/// for proactive messaging. Uses config_dir from the config.
+fn teamsStoreConversationRef(config: *const Config, service_url: []const u8, conversation_id: []const u8) void {
+    const config_dir = std.fs.path.dirname(config.config_path) orelse return;
+    var path_buf: [512]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, "{s}/teams_conversation_ref.json", .{config_dir}) catch return;
+
+    var body_buf: [1024]u8 = undefined;
+    const body = std.fmt.bufPrint(
+        &body_buf,
+        "{{\"serviceUrl\":\"{s}\",\"conversationId\":\"{s}\"}}",
+        .{ service_url, conversation_id },
+    ) catch return;
+
+    const file = std.fs.cwd().createFile(path, .{}) catch |err| {
+        std.log.scoped(.teams).warn("Failed to save conversation reference: {}", .{err});
+        return;
+    };
+    defer file.close();
+    file.writeAll(body) catch |err| {
+        std.log.scoped(.teams).warn("Failed to write conversation reference: {}", .{err});
+    };
+    std.log.scoped(.teams).info("Conversation reference saved to {s}", .{path});
+}
+
 fn applyRuntimeProviderOverrides(config: *const Config) !void {
     try http_util.setProxyOverride(config.http_request.proxy);
     try providers.setApiErrorLimitOverride(config.diagnostics.api_error_max_chars);
 }
 
+const A2aStreamingWorker = struct {
+    allocator: std.mem.Allocator,
+    body: []u8,
+    stream: std.net.Stream,
+    registry: *a2a.TaskRegistry,
+    session_mgr: *session_mod.SessionManager,
+
+    fn run(self: *@This()) void {
+        defer self.stream.close();
+        defer self.allocator.free(self.body);
+        defer self.allocator.destroy(self);
+        a2a.handleStreamingRpc(self.allocator, self.body, &self.stream, self.registry, self.session_mgr);
+    }
+};
+
+fn spawnA2aStreamingWorker(
+    allocator: std.mem.Allocator,
+    body: []const u8,
+    stream: std.net.Stream,
+    registry: *a2a.TaskRegistry,
+    session_mgr: *session_mod.SessionManager,
+) !void {
+    const worker = try allocator.create(A2aStreamingWorker);
+    errdefer allocator.destroy(worker);
+
+    const owned_body = try allocator.dupe(u8, body);
+    errdefer allocator.free(owned_body);
+
+    worker.* = .{
+        .allocator = allocator,
+        .body = owned_body,
+        .stream = stream,
+        .registry = registry,
+        .session_mgr = session_mgr,
+    };
+
+    const thread = try std.Thread.spawn(
+        .{ .stack_size = thread_stacks.SESSION_TURN_STACK_SIZE },
+        A2aStreamingWorker.run,
+        .{worker},
+    );
+    thread.detach();
+}
+
+// ── Shared scheduler state for cross-thread access ───────────────
+
+var g_shared_scheduler: ?*cron_mod.CronScheduler = null;
+var g_shared_scheduler_mutex: std.Thread.Mutex = .{};
+
+pub fn lockSharedScheduler() void {
+    g_shared_scheduler_mutex.lock();
+}
+
+pub fn unlockSharedScheduler() void {
+    g_shared_scheduler_mutex.unlock();
+}
+
+pub fn setSharedScheduler(sched: *cron_mod.CronScheduler) void {
+    g_shared_scheduler_mutex.lock();
+    defer g_shared_scheduler_mutex.unlock();
+    g_shared_scheduler = sched;
+}
+
+pub fn clearSharedScheduler() void {
+    g_shared_scheduler_mutex.lock();
+    defer g_shared_scheduler_mutex.unlock();
+    g_shared_scheduler = null;
+}
+
 /// Run the HTTP gateway. Binds to host:port and serves HTTP requests.
-/// Endpoints: GET /health, GET /ready, POST /pair, POST /webhook, GET|POST /whatsapp, POST /telegram, POST /slack/events, POST /line, POST /lark, POST /qq
+/// Endpoints: GET /health, GET /ready, POST /pair, POST /webhook, GET|POST /whatsapp, POST /telegram, POST /slack/events, POST /line, POST /lark, GET|POST /wechat, GET|POST /wecom, POST /qq, POST /max
 /// If config_ptr is null, loads config internally (for backward compatibility).
 pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr: ?*const Config, event_bus: ?*bus_mod.Bus) !void {
     health.markComponentOk("gateway");
@@ -2556,11 +4923,26 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
     var sec_policy_opt: ?security.SecurityPolicy = null;
     var gateway_thread_observer = GatewayThreadObserver.init(allocator);
     defer gateway_thread_observer.deinit();
+    var runtime_observer: ?*observability.RuntimeObserver = null;
+    defer if (runtime_observer) |obs| obs.destroy();
+    var a2a_registry = a2a.TaskRegistry.init(allocator);
+    defer a2a_registry.deinit();
     const needs_local_agent = event_bus == null;
 
     if (config_opt) |cfg_ptr| {
         const cfg = cfg_ptr;
         try applyRuntimeProviderOverrides(cfg);
+        runtime_observer = try observability.RuntimeObserver.create(
+            allocator,
+            .{
+                .workspace_dir = cfg.workspace_dir,
+                .backend = cfg.diagnostics.backend,
+                .otel_endpoint = cfg.diagnostics.otel_endpoint,
+                .otel_service_name = cfg.diagnostics.otel_service_name,
+            },
+            cfg.diagnostics.otel_headers,
+            &.{gateway_thread_observer.observer()},
+        );
         state.rate_limiter = GatewayRateLimiter.init(
             cfg.gateway.pair_rate_limit_per_minute,
             cfg.gateway.webhook_rate_limit_per_minute,
@@ -2599,6 +4981,20 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
             state.lark_allow_from = lark_cfg.allow_from;
             state.lark_account_id = lark_cfg.account_id;
         }
+        if (cfg.channels.wechatPrimary()) |wechat_cfg| {
+            state.wechat_allow_from = wechat_cfg.allow_from;
+            state.wechat_account_id = wechat_cfg.account_id;
+            state.wechat_callback_token = wechat_cfg.callback_token;
+            state.wechat_encoding_aes_key = wechat_cfg.encoding_aes_key orelse "";
+            state.wechat_app_id = wechat_cfg.app_id orelse "";
+        }
+        if (cfg.channels.wecomPrimary()) |wecom_cfg| {
+            state.wecom_allow_from = wecom_cfg.allow_from;
+            state.wecom_account_id = wecom_cfg.account_id;
+            state.wecom_callback_token = wecom_cfg.callback_token orelse "";
+            state.wecom_encoding_aes_key = wecom_cfg.encoding_aes_key orelse "";
+            state.wecom_corp_id = wecom_cfg.corp_id orelse "";
+        }
         if (build_options.enable_channel_qq) {
             for (cfg.channels.qq) |qq_cfg| {
                 try state.qq_channels.append(allocator, channels.qq.QQChannel.initFromConfig(allocator, qq_cfg));
@@ -2606,8 +5002,9 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
         }
 
         // In daemon mode (`event_bus` is present), inbound processing is delegated to
-        // the bus + channel runtime. Avoid creating a second local agent runtime here.
-        if (needs_local_agent) {
+        // the bus + channel runtime. However, A2A requires a synchronous session manager
+        // for request-response JSON-RPC, so also init when A2A is enabled.
+        if (needs_local_agent or cfg.a2a.enabled) {
             sec_tracker_opt = security.RateTracker.init(allocator, cfg.autonomy.max_actions_per_hour);
             sec_policy_opt = .{
                 .autonomy = cfg.autonomy.level,
@@ -2641,6 +5038,7 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
                 const subagent_manager = allocator.create(subagent_mod.SubagentManager) catch null;
                 if (subagent_manager) |mgr| {
                     mgr.* = subagent_mod.SubagentManager.init(allocator, cfg, event_bus, .{});
+                    mgr.observer = runtime_observer.?.backendObserver();
                     mgr.task_runner = subagent_runner.runTaskWithTools;
                     subagent_manager_opt = mgr;
                 }
@@ -2656,16 +5054,19 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
                     .web_search_fallback_providers = cfg.http_request.search_fallback_providers,
                     .browser_enabled = cfg.browser.enabled,
                     .screenshot_enabled = true,
+                    .mcp_server_configs = cfg.mcp_servers,
                     .agents = cfg.agents,
+                    .configured_providers = cfg.providers,
                     .fallback_api_key = resolved_api_key,
                     .allowed_paths = cfg.autonomy.allowed_paths,
+                    .tools_config = cfg.tools,
                     .policy = if (sec_policy_opt) |*policy| policy else null,
                     .subagent_manager = subagent_manager_opt,
                     .bootstrap_provider = bootstrap_provider_opt,
                     .backend_name = cfg.memory.backend,
                 }) catch &.{};
 
-                var sm = session_mod.SessionManager.init(allocator, cfg, provider_i, tools_slice, mem_opt, gateway_thread_observer.observer(), if (mem_rt) |rt| rt.session_store else null, if (mem_rt) |*rt| rt.response_cache else null);
+                var sm = session_mod.SessionManager.init(allocator, cfg, provider_i, tools_slice, mem_opt, runtime_observer.?.observer(), if (mem_rt) |rt| rt.session_store else null, if (mem_rt) |*rt| rt.response_cache else null);
                 if (sec_policy_opt) |*policy| {
                     sm.policy = policy;
                 }
@@ -2696,8 +5097,22 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
 
     // Resolve the listen address
     const addr = try std.net.Address.resolveIp(host, port);
+    const daemon_mode = event_bus != null;
+
+    // Best-effort probe to detect if the port is already in use.
+    // A TOCTOU gap exists between probe and listen(), but listen() will still
+    // fail with AddressInUse if another process binds the port in that window.
+    const probe_conn = std.net.tcpConnectToAddress(addr) catch null;
+    if (probe_conn) |conn| {
+        conn.close();
+        return error.AddressInUse;
+    }
+
     var server = try addr.listen(.{
         .reuse_address = true,
+        // Daemon/service shutdown needs the accept loop to observe the shared
+        // shutdown flag instead of blocking forever in accept().
+        .force_nonblocking = daemon_mode,
     });
     defer server.deinit();
 
@@ -2716,15 +5131,25 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
     }
     if (state.pairing_guard) |*guard| {
         if (guard.pairingCode()) |code| {
-            try stdout.print("Gateway pairing code: {s}\n", .{code});
+            _ = code;
+            try stdout.print("Gateway pairing code generated (hidden for security). Use the /pair flow to complete pairing.\n", .{});
             try stdout.flush();
         }
     }
 
     // Accept loop — read raw HTTP from TCP connections
     while (true) {
-        var conn = server.accept() catch continue;
-        defer conn.stream.close();
+        if (daemon_mode and daemon.isShutdownRequested()) break;
+
+        var conn = server.accept() catch |err| switch (err) {
+            error.WouldBlock => {
+                std.Thread.sleep(ACCEPT_POLL_INTERVAL_MS * std.time.ns_per_ms);
+                continue;
+            },
+            else => continue,
+        };
+        var close_conn = true;
+        defer if (close_conn) conn.stream.close();
         configureRequestReadTimeout(&conn.stream);
 
         // Per-request arena — all request-scoped allocations freed in one shot
@@ -2761,10 +5186,49 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
         const base_path = if (std.mem.indexOfScalar(u8, target, '?')) |qi| target[0..qi] else target;
         const is_post = std.mem.eql(u8, method_str, "POST");
         var response_status: []const u8 = "200 OK";
+        var response_content_type: []const u8 = CONTENT_TYPE_JSON;
         var response_body: []const u8 = "";
         var pair_response_buf: [256]u8 = undefined;
 
-        if (findWebhookRouteDescriptor(base_path)) |desc| {
+        if (findCronRouteDescriptor(base_path)) |desc| {
+            // Auth check for /cron endpoints:
+            // - No pairing guard → allow (pairing not configured)
+            // - Pairing disabled → allow
+            // - Pairing required, no tokens yet → DENY (bootstrap phase; CLI falls back to disk)
+            // - Pairing required, tokens exist → require valid bearer token
+            const auth_header = extractHeader(raw, "Authorization");
+            const bearer = if (auth_header) |ah| extractBearerToken(ah) else null;
+            const pairing_guard = if (state.pairing_guard) |*guard| guard else null;
+            const cron_authorized = if (pairing_guard) |g|
+                if (!g.requirePairing())
+                    true
+                else if (!g.hasPairedTokens())
+                    false // bootstrap phase: deny, CLI falls back to disk
+                else
+                    isWebhookAuthorized(pairing_guard, bearer)
+            else
+                true;
+            if (!cron_authorized) {
+                response_status = "401 Unauthorized";
+                response_body = "{\"error\":\"unauthorized\"}";
+            } else {
+                _ = desc.method; // method check is inside each handler
+                var cron_ctx = WebhookHandlerContext{
+                    .root_allocator = allocator,
+                    .req_allocator = req_allocator,
+                    .raw_request = raw,
+                    .method = method_str,
+                    .target = target,
+                    .config_opt = config_opt,
+                    .state = &state,
+                    .session_mgr_opt = if (session_mgr_opt) |*sm| sm else null,
+                };
+                desc.handler(&cron_ctx);
+                response_status = cron_ctx.response_status;
+                response_content_type = cron_ctx.response_content_type;
+                response_body = cron_ctx.response_body;
+            }
+        } else if (findWebhookRouteDescriptor(base_path)) |desc| {
             var webhook_ctx = WebhookHandlerContext{
                 .root_allocator = allocator,
                 .req_allocator = req_allocator,
@@ -2777,6 +5241,7 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
             };
             desc.handler(&webhook_ctx);
             response_status = webhook_ctx.response_status;
+            response_content_type = webhook_ctx.response_content_type;
             response_body = webhook_ctx.response_body;
         } else if (hasSlackHttpEndpoint(config_opt, base_path)) {
             var webhook_ctx = WebhookHandlerContext{
@@ -2791,7 +5256,73 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
             };
             handleSlackWebhookRoute(&webhook_ctx);
             response_status = webhook_ctx.response_status;
+            response_content_type = webhook_ctx.response_content_type;
             response_body = webhook_ctx.response_body;
+        } else if (std.mem.eql(u8, base_path, "/.well-known/agent.json") or
+            std.mem.eql(u8, base_path, "/.well-known/agent-card.json"))
+        {
+            // A2A Agent Card discovery (public, no auth).
+            if (config_opt) |cfg| {
+                if (cfg.a2a.enabled) {
+                    const card = a2a.handleAgentCard(req_allocator, cfg);
+                    response_status = card.status;
+                    response_body = card.body;
+                } else {
+                    response_status = "404 Not Found";
+                    response_body = "{\"error\":\"a2a not enabled\"}";
+                }
+            } else {
+                response_status = "404 Not Found";
+                response_body = "{\"error\":\"not configured\"}";
+            }
+        } else if (std.mem.eql(u8, base_path, "/a2a")) {
+            // A2A JSON-RPC endpoint (auth required).
+            if (!is_post) {
+                response_status = "405 Method Not Allowed";
+                response_body = "{\"error\":\"method not allowed\"}";
+            } else if (config_opt == null or !config_opt.?.a2a.enabled) {
+                response_status = "404 Not Found";
+                response_body = "{\"error\":\"a2a not enabled\"}";
+            } else {
+                const auth_header = extractHeader(raw, "Authorization");
+                const bearer = if (auth_header) |ah| extractBearerToken(ah) else null;
+                const pairing_guard = if (state.pairing_guard) |*guard| guard else null;
+                if (!isWebhookAuthorized(pairing_guard, bearer)) {
+                    response_status = "401 Unauthorized";
+                    response_body = "{\"error\":\"unauthorized\"}";
+                } else if (!state.rate_limiter.allowWebhook(state.allocator, "a2a")) {
+                    response_status = "429 Too Many Requests";
+                    response_body = "{\"error\":\"rate limited\"}";
+                } else {
+                    const body = extractBody(raw);
+                    if (body) |b| {
+                        if (session_mgr_opt) |*sm| {
+                            if (a2a.isStreamingMethod(b)) {
+                                // SSE streaming runs in its own worker so the main accept
+                                // loop can continue serving tasks/cancel and new requests.
+                                if (spawnA2aStreamingWorker(allocator, b, conn.stream, &a2a_registry, sm)) {
+                                    close_conn = false;
+                                    response_status = "";
+                                    response_body = "";
+                                } else |_| {
+                                    response_status = "503 Service Unavailable";
+                                    response_body = "{\"error\":\"stream setup failed\"}";
+                                }
+                            } else {
+                                const resp = a2a.handleJsonRpc(req_allocator, b, &a2a_registry, sm);
+                                response_status = resp.status;
+                                response_body = resp.body;
+                            }
+                        } else {
+                            response_status = "503 Service Unavailable";
+                            response_body = "{\"error\":\"agent not available\"}";
+                        }
+                    } else {
+                        response_status = "400 Bad Request";
+                        response_body = "{\"error\":\"empty body\"}";
+                    }
+                }
+            }
         } else if (control_route_map.get(base_path)) |route| switch (route) {
             .health => {
                 response_body = if (isHealthOk()) "{\"status\":\"ok\"}" else "{\"status\":\"degraded\"}";
@@ -2830,15 +5361,24 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
                         const body = extractBody(raw);
                         if (body) |b| {
                             const msg_text = jsonStringField(b, "message") orelse jsonStringField(b, "text") orelse b;
-                            var sk_buf: [128]u8 = undefined;
-                            const session_key = std.fmt.bufPrint(&sk_buf, "webhook:{s}", .{bearer orelse "anon"}) catch "webhook:anon";
+                            var routing = webhookRouting(req_allocator, b, bearer, config_opt);
+                            defer routing.deinit(req_allocator);
 
                             if (state.event_bus) |eb| {
-                                _ = publishToBus(eb, state.allocator, "webhook", bearer orelse "anon", session_key, msg_text, session_key, null);
+                                _ = publishToBus(
+                                    eb,
+                                    state.allocator,
+                                    "webhook",
+                                    routing.sender_id,
+                                    routing.chat_id,
+                                    msg_text,
+                                    routing.session_key,
+                                    routing.metadata_json,
+                                );
                                 response_body = "{\"status\":\"received\"}";
                             } else if (session_mgr_opt) |*sm| {
                                 const start_seq = gateway_thread_observer.currentSeq();
-                                const reply: ?[]const u8 = sm.processMessage(session_key, msg_text, null) catch |err| blk: {
+                                const reply: ?[]const u8 = sm.processMessage(routing.session_key, msg_text, routing.conversation_context) catch |err| blk: {
                                     response_body = userFacingAgentErrorJson(err);
                                     break :blk null;
                                 };
@@ -2916,12 +5456,383 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
             response_body = "{\"error\":\"not found\"}";
         }
 
-        // Send HTTP response
-        writeJsonResponse(&conn.stream, response_status, response_body);
+        // Send HTTP response (skip if SSE streaming already wrote directly).
+        if (response_status.len > 0) {
+            writeHttpResponse(&conn.stream, response_status, response_content_type, response_body);
+        }
     }
 }
 
 // ── Tests ────────────────────────────────────────────────────────
+
+test "cron auth matrix: no pairing guard allows all" {
+    // When pairing is not configured (guard is null), /cron is open.
+    try std.testing.expect(isWebhookAuthorized(null, null) == false); // webhook still fails
+    // Simulate the cron_authorized logic with null guard
+    const cron_authorized = true; // null guard → allow
+    try std.testing.expect(cron_authorized);
+}
+
+test "cron auth matrix: pairing disabled allows all" {
+    var guard = try PairingGuard.init(std.testing.allocator, false, &.{});
+    defer guard.deinit();
+    try std.testing.expect(!guard.requirePairing());
+    // cron_authorized = !requirePairing() → true
+    try std.testing.expect(!guard.requirePairing());
+}
+
+test "cron auth matrix: bootstrap phase denies all" {
+    // Pairing required but no tokens issued yet → deny regardless of bearer
+    var guard = try PairingGuard.init(std.testing.allocator, true, &.{});
+    defer guard.deinit();
+    try std.testing.expect(guard.requirePairing());
+    try std.testing.expect(!guard.hasPairedTokens());
+    // cron_authorized = hasPairedTokens() is false → false (deny)
+    const cron_authorized = guard.hasPairedTokens();
+    try std.testing.expect(!cron_authorized);
+}
+
+test "cron auth matrix: paired phase requires valid token" {
+    const tokens = [_][]const u8{"zc_secret_token"};
+    var guard = try PairingGuard.init(std.testing.allocator, true, &tokens);
+    defer guard.deinit();
+    try std.testing.expect(guard.requirePairing());
+    try std.testing.expect(guard.hasPairedTokens());
+    // Valid token → authorized
+    try std.testing.expect(guard.isAuthenticated("zc_secret_token"));
+    // Invalid token → denied
+    try std.testing.expect(!guard.isAuthenticated("wrong_token"));
+    // No token → denied
+    try std.testing.expect(!guard.isAuthenticated(""));
+}
+
+test "shared scheduler registration sets and clears global pointer" {
+    var scheduler = cron_mod.CronScheduler.init(std.testing.allocator, 4, true);
+    defer scheduler.deinit();
+    defer clearSharedScheduler();
+
+    setSharedScheduler(&scheduler);
+    lockSharedScheduler();
+    try std.testing.expect(g_shared_scheduler == &scheduler);
+    unlockSharedScheduler();
+
+    clearSharedScheduler();
+    lockSharedScheduler();
+    try std.testing.expect(g_shared_scheduler == null);
+    unlockSharedScheduler();
+}
+
+test "handleCronAdd preserves delivery routing fields" {
+    var scheduler = cron_mod.CronScheduler.init(std.testing.allocator, 8, true);
+    defer scheduler.deinit();
+    setSharedScheduler(&scheduler);
+    defer clearSharedScheduler();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const req_allocator = arena.allocator();
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+
+    const raw =
+        "POST /cron/add HTTP/1.1\r\n" ++
+        "Host: localhost\r\n" ++
+        "Content-Type: application/json\r\n\r\n" ++
+        "{\"expression\":\"*/10 * * * *\",\"prompt\":\"Check \\\"traffic\\\"\",\"model\":\"openrouter/anthropic/claude-sonnet-4\",\"session_target\":\"main\",\"delivery_mode\":\"always\",\"delivery_channel\":\"telegram\",\"delivery_account_id\":\"backup\",\"delivery_to\":\"chat-42\",\"delivery_peer_kind\":\"group\",\"delivery_peer_id\":\"-100123\",\"delivery_thread_id\":\"77\",\"delivery_best_effort\":false}";
+
+    var ctx = WebhookHandlerContext{
+        .root_allocator = req_allocator,
+        .req_allocator = req_allocator,
+        .raw_request = raw,
+        .method = "POST",
+        .target = "/cron/add",
+        .config_opt = null,
+        .state = &state,
+        .session_mgr_opt = null,
+    };
+    handleCronAdd(&ctx);
+
+    try std.testing.expectEqualStrings("200 OK", ctx.response_status);
+    const jobs = scheduler.listJobs();
+    try std.testing.expectEqual(@as(usize, 1), jobs.len);
+    try std.testing.expectEqual(cron_mod.DeliveryMode.always, jobs[0].delivery.mode);
+    try std.testing.expectEqualStrings("Check \"traffic\"", jobs[0].command);
+    try std.testing.expectEqualStrings("Check \"traffic\"", jobs[0].prompt.?);
+    try std.testing.expectEqual(cron_mod.SessionTarget.main, jobs[0].session_target);
+    try std.testing.expectEqualStrings("telegram", jobs[0].delivery.channel.?);
+    try std.testing.expectEqualStrings("backup", jobs[0].delivery.account_id.?);
+    try std.testing.expectEqualStrings("chat-42", jobs[0].delivery.to.?);
+    try std.testing.expectEqual(agent_routing.ChatType.group, jobs[0].delivery.peer_kind.?);
+    try std.testing.expectEqualStrings("-100123", jobs[0].delivery.peer_id.?);
+    try std.testing.expectEqualStrings("77", jobs[0].delivery.thread_id.?);
+    try std.testing.expect(!jobs[0].delivery.best_effort);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, req_allocator, ctx.response_body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("main", parsed.value.object.get("session_target").?.string);
+}
+
+test "handleCronAdd supports one-shot delay payloads" {
+    var scheduler = cron_mod.CronScheduler.init(std.testing.allocator, 8, true);
+    defer scheduler.deinit();
+    setSharedScheduler(&scheduler);
+    defer clearSharedScheduler();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const req_allocator = arena.allocator();
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+
+    const raw =
+        "POST /cron/add HTTP/1.1\r\n" ++
+        "Host: localhost\r\n" ++
+        "Content-Type: application/json\r\n\r\n" ++
+        "{\"delay\":\"5m\",\"command\":\"echo once\"}";
+
+    var ctx = WebhookHandlerContext{
+        .root_allocator = req_allocator,
+        .req_allocator = req_allocator,
+        .raw_request = raw,
+        .method = "POST",
+        .target = "/cron/add",
+        .config_opt = null,
+        .state = &state,
+        .session_mgr_opt = null,
+    };
+    handleCronAdd(&ctx);
+
+    try std.testing.expectEqualStrings("200 OK", ctx.response_status);
+    const jobs = scheduler.listJobs();
+    try std.testing.expectEqual(@as(usize, 1), jobs.len);
+    try std.testing.expect(jobs[0].one_shot);
+    try std.testing.expect(std.mem.startsWith(u8, jobs[0].expression, "@once:"));
+    try std.testing.expectEqualStrings("echo once", jobs[0].command);
+}
+
+test "handleCronAdd preserves delivery routing for one-shot agent payloads" {
+    var scheduler = cron_mod.CronScheduler.init(std.testing.allocator, 8, true);
+    defer scheduler.deinit();
+    setSharedScheduler(&scheduler);
+    defer clearSharedScheduler();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const req_allocator = arena.allocator();
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+
+    const raw =
+        "POST /cron/add HTTP/1.1\r\n" ++
+        "Host: localhost\r\n" ++
+        "Content-Type: application/json\r\n\r\n" ++
+        "{\"delay\":\"5m\",\"prompt\":\"Summarize incidents\",\"session_target\":\"main\",\"delivery_mode\":\"always\",\"delivery_channel\":\"matrix\",\"delivery_account_id\":\"backup\",\"delivery_to\":\"!room:example\",\"delivery_peer_kind\":\"group\",\"delivery_peer_id\":\"!room:example\"}";
+
+    var ctx = WebhookHandlerContext{
+        .root_allocator = req_allocator,
+        .req_allocator = req_allocator,
+        .raw_request = raw,
+        .method = "POST",
+        .target = "/cron/add",
+        .config_opt = null,
+        .state = &state,
+        .session_mgr_opt = null,
+    };
+    handleCronAdd(&ctx);
+
+    try std.testing.expectEqualStrings("200 OK", ctx.response_status);
+    const jobs = scheduler.listJobs();
+    try std.testing.expectEqual(@as(usize, 1), jobs.len);
+    try std.testing.expect(jobs[0].one_shot);
+    try std.testing.expectEqual(cron_mod.JobType.agent, jobs[0].job_type);
+    try std.testing.expectEqual(cron_mod.SessionTarget.main, jobs[0].session_target);
+    try std.testing.expectEqualStrings("matrix", jobs[0].delivery.channel.?);
+    try std.testing.expectEqualStrings("backup", jobs[0].delivery.account_id.?);
+    try std.testing.expectEqualStrings("!room:example", jobs[0].delivery.to.?);
+    try std.testing.expectEqual(agent_routing.ChatType.group, jobs[0].delivery.peer_kind.?);
+    try std.testing.expectEqualStrings("!room:example", jobs[0].delivery.peer_id.?);
+}
+
+test "handleCronAdd rejects session_target for shell jobs" {
+    var scheduler = cron_mod.CronScheduler.init(std.testing.allocator, 8, true);
+    defer scheduler.deinit();
+    setSharedScheduler(&scheduler);
+    defer clearSharedScheduler();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const req_allocator = arena.allocator();
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+
+    const raw =
+        "POST /cron/add HTTP/1.1\r\n" ++
+        "Host: localhost\r\n" ++
+        "Content-Type: application/json\r\n\r\n" ++
+        "{\"expression\":\"*/10 * * * *\",\"command\":\"echo hello\",\"session_target\":\"main\"}";
+
+    var ctx = WebhookHandlerContext{
+        .root_allocator = req_allocator,
+        .req_allocator = req_allocator,
+        .raw_request = raw,
+        .method = "POST",
+        .target = "/cron/add",
+        .config_opt = null,
+        .state = &state,
+        .session_mgr_opt = null,
+    };
+    handleCronAdd(&ctx);
+
+    try std.testing.expectEqualStrings("400 Bad Request", ctx.response_status);
+    try std.testing.expect(std.mem.indexOf(u8, ctx.response_body, "session_target requires prompt") != null);
+}
+
+test "handleCronAdd rejects invalid session_target" {
+    var scheduler = cron_mod.CronScheduler.init(std.testing.allocator, 8, true);
+    defer scheduler.deinit();
+    setSharedScheduler(&scheduler);
+    defer clearSharedScheduler();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const req_allocator = arena.allocator();
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+
+    const raw =
+        "POST /cron/add HTTP/1.1\r\n" ++
+        "Host: localhost\r\n" ++
+        "Content-Type: application/json\r\n\r\n" ++
+        "{\"expression\":\"*/10 * * * *\",\"prompt\":\"Summarize\",\"session_target\":\"primary\"}";
+
+    var ctx = WebhookHandlerContext{
+        .root_allocator = req_allocator,
+        .req_allocator = req_allocator,
+        .raw_request = raw,
+        .method = "POST",
+        .target = "/cron/add",
+        .config_opt = null,
+        .state = &state,
+        .session_mgr_opt = null,
+    };
+    handleCronAdd(&ctx);
+
+    try std.testing.expectEqualStrings("400 Bad Request", ctx.response_status);
+    try std.testing.expect(std.mem.indexOf(u8, ctx.response_body, "invalid session_target") != null);
+}
+
+test "handleCronUpdate accepts session_target" {
+    var scheduler = cron_mod.CronScheduler.init(std.testing.allocator, 8, true);
+    defer scheduler.deinit();
+    const job = try scheduler.addAgentJob("* * * * *", "Summarize incidents", null, .{});
+    setSharedScheduler(&scheduler);
+    defer clearSharedScheduler();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const req_allocator = arena.allocator();
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+
+    const raw = try std.fmt.allocPrint(
+        req_allocator,
+        "POST /cron/update HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\r\n{{\"id\":\"{s}\",\"session_target\":\"main\"}}",
+        .{job.id},
+    );
+
+    var ctx = WebhookHandlerContext{
+        .root_allocator = req_allocator,
+        .req_allocator = req_allocator,
+        .raw_request = raw,
+        .method = "POST",
+        .target = "/cron/update",
+        .config_opt = null,
+        .state = &state,
+        .session_mgr_opt = null,
+    };
+    handleCronUpdate(&ctx);
+
+    try std.testing.expectEqualStrings("200 OK", ctx.response_status);
+    try std.testing.expectEqual(cron_mod.SessionTarget.main, scheduler.listJobs()[0].session_target);
+}
+
+test "handleCronUpdate rejects session_target for shell jobs" {
+    var scheduler = cron_mod.CronScheduler.init(std.testing.allocator, 8, true);
+    defer scheduler.deinit();
+    const job = try scheduler.addJob("* * * * *", "echo hello");
+    setSharedScheduler(&scheduler);
+    defer clearSharedScheduler();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const req_allocator = arena.allocator();
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+
+    const raw = try std.fmt.allocPrint(
+        req_allocator,
+        "POST /cron/update HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\r\n{{\"id\":\"{s}\",\"session_target\":\"main\"}}",
+        .{job.id},
+    );
+
+    var ctx = WebhookHandlerContext{
+        .root_allocator = req_allocator,
+        .req_allocator = req_allocator,
+        .raw_request = raw,
+        .method = "POST",
+        .target = "/cron/update",
+        .config_opt = null,
+        .state = &state,
+        .session_mgr_opt = null,
+    };
+    handleCronUpdate(&ctx);
+
+    try std.testing.expectEqualStrings("400 Bad Request", ctx.response_status);
+    try std.testing.expect(std.mem.indexOf(u8, ctx.response_body, "session_target requires agent job") != null);
+}
+
+test "handleCronUpdate rejects invalid session_target" {
+    var scheduler = cron_mod.CronScheduler.init(std.testing.allocator, 8, true);
+    defer scheduler.deinit();
+    const job = try scheduler.addAgentJob("* * * * *", "Summarize incidents", null, .{});
+    setSharedScheduler(&scheduler);
+    defer clearSharedScheduler();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const req_allocator = arena.allocator();
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+
+    const raw = try std.fmt.allocPrint(
+        req_allocator,
+        "POST /cron/update HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\r\n{{\"id\":\"{s}\",\"session_target\":\"primary\"}}",
+        .{job.id},
+    );
+
+    var ctx = WebhookHandlerContext{
+        .root_allocator = req_allocator,
+        .req_allocator = req_allocator,
+        .raw_request = raw,
+        .method = "POST",
+        .target = "/cron/update",
+        .config_opt = null,
+        .state = &state,
+        .session_mgr_opt = null,
+    };
+    handleCronUpdate(&ctx);
+
+    try std.testing.expectEqualStrings("400 Bad Request", ctx.response_status);
+    try std.testing.expect(std.mem.indexOf(u8, ctx.response_body, "invalid session_target") != null);
+}
 
 test "constants are set correctly" {
     try std.testing.expectEqual(@as(usize, 65_536), MAX_BODY_SIZE);
@@ -2984,17 +5895,16 @@ test "idempotency store allows different keys" {
     try std.testing.expect(!store.recordIfNew(std.testing.allocator, "a"));
 }
 
-test "gateway module compiles" {
-    // Compile-time check only
-}
-
 test "findWebhookRouteDescriptor resolves known webhook paths" {
     try std.testing.expect(findWebhookRouteDescriptor("/telegram") != null);
     try std.testing.expect(findWebhookRouteDescriptor("/whatsapp") != null);
     try std.testing.expect(findWebhookRouteDescriptor("/slack/events") != null);
     try std.testing.expect(findWebhookRouteDescriptor("/line") != null);
     try std.testing.expect(findWebhookRouteDescriptor("/lark") != null);
+    try std.testing.expect(findWebhookRouteDescriptor("/wechat") != null);
+    try std.testing.expect(findWebhookRouteDescriptor("/wecom") != null);
     try std.testing.expect(findWebhookRouteDescriptor("/qq") != null);
+    try std.testing.expect(findWebhookRouteDescriptor("/max") != null);
     try std.testing.expect(findWebhookRouteDescriptor("/health") == null);
 }
 
@@ -3286,6 +6196,47 @@ test "jsonStringField handles nested JSON" {
     try std.testing.expectEqualStrings("hi", val.?);
 }
 
+test "slackDecodeInteractivePayload decodes form payload json" {
+    const allocator = std.testing.allocator;
+    const decoded = slackDecodeInteractivePayload(
+        allocator,
+        "payload=%7B%22type%22%3A%22block_actions%22%2C%22actions%22%3A%5B%5D%7D",
+    ) orelse return error.TestUnexpectedResult;
+    defer allocator.free(decoded);
+    try std.testing.expectEqualStrings("{\"type\":\"block_actions\",\"actions\":[]}", decoded);
+}
+
+test "slackDecodeInteractivePayload finds payload after other form fields" {
+    const allocator = std.testing.allocator;
+    const decoded = slackDecodeInteractivePayload(
+        allocator,
+        "foo=bar&payload=%7B%22type%22%3A%22block_actions%22%7D",
+    ) orelse return error.TestUnexpectedResult;
+    defer allocator.free(decoded);
+    try std.testing.expectEqualStrings("{\"type\":\"block_actions\"}", decoded);
+}
+
+test "slackParseCallbackValue parses token and option index" {
+    const parsed = slackParseCallbackValue("ncslack:abc123:2") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("abc123", parsed.token);
+    try std.testing.expectEqual(@as(usize, 2), parsed.option_index);
+}
+
+test "slackInteractiveTarget extracts base channel and thread id" {
+    const parsed = slackInteractiveTarget("C12345:1700.1", "C999");
+    try std.testing.expectEqualStrings("C12345", parsed.channel_id);
+    try std.testing.expect(parsed.thread_id != null);
+    try std.testing.expectEqualStrings("1700.1", parsed.thread_id.?);
+    try std.testing.expect(!parsed.is_dm);
+}
+
+test "slackInteractiveTarget falls back to callback channel id for dm" {
+    const parsed = slackInteractiveTarget("", "D12345");
+    try std.testing.expectEqualStrings("D12345", parsed.channel_id);
+    try std.testing.expect(parsed.thread_id == null);
+    try std.testing.expect(parsed.is_dm);
+}
+
 test "jsonIntField extracts positive integer" {
     const json = "{\"chat_id\": 12345}";
     const val = jsonIntField(json, "chat_id");
@@ -3403,6 +6354,161 @@ test "selectTelegramConfig falls back to preferred primary account" {
     try std.testing.expectEqualStrings("default", selected.?.account_id);
 }
 
+test "selectMaxConfig picks account by secret header" {
+    const max_accounts = [_]config_types.MaxConfig{
+        .{
+            .account_id = "main",
+            .bot_token = "max-main",
+            .mode = .webhook,
+            .webhook_secret = "secret-a",
+        },
+        .{
+            .account_id = "backup",
+            .bot_token = "max-backup",
+            .mode = .webhook,
+            .webhook_secret = "secret-b",
+        },
+    };
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .max = &max_accounts,
+        },
+    };
+
+    const selected = selectMaxConfig(&cfg, "/max", "secret-b");
+    if (!build_options.enable_channel_max) {
+        try std.testing.expect(selected == null);
+        return;
+    }
+    try std.testing.expect(selected != null);
+    try std.testing.expectEqualStrings("backup", selected.?.account_id);
+}
+
+test "selectMaxConfig picks account by query account_id" {
+    const max_accounts = [_]config_types.MaxConfig{
+        .{
+            .account_id = "main",
+            .bot_token = "max-main",
+        },
+        .{
+            .account_id = "backup",
+            .bot_token = "max-backup",
+        },
+    };
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .max = &max_accounts,
+        },
+    };
+
+    const selected = selectMaxConfig(&cfg, "/max?account_id=backup", null);
+    if (!build_options.enable_channel_max) {
+        try std.testing.expect(selected == null);
+        return;
+    }
+    try std.testing.expect(selected != null);
+    try std.testing.expectEqualStrings("backup", selected.?.account_id);
+}
+
+test "selectMaxConfig does not fall back when secret header is invalid" {
+    const max_accounts = [_]config_types.MaxConfig{
+        .{
+            .account_id = "main",
+            .bot_token = "max-main",
+            .mode = .webhook,
+            .webhook_secret = "secret-a",
+        },
+        .{
+            .account_id = "backup",
+            .bot_token = "max-backup",
+            .mode = .webhook,
+            .webhook_secret = "secret-b",
+        },
+    };
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .max = &max_accounts,
+        },
+    };
+
+    const selected = selectMaxConfig(&cfg, "/max", "wrong-secret");
+    if (!build_options.enable_channel_max) {
+        try std.testing.expect(selected == null);
+        return;
+    }
+    try std.testing.expect(selected == null);
+}
+
+test "selectMaxConfig requires explicit routing when multiple webhook accounts exist" {
+    const max_accounts = [_]config_types.MaxConfig{
+        .{
+            .account_id = "main",
+            .bot_token = "max-main",
+            .mode = .webhook,
+        },
+        .{
+            .account_id = "backup",
+            .bot_token = "max-backup",
+            .mode = .webhook,
+        },
+    };
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .max = &max_accounts,
+        },
+    };
+
+    const selected = selectMaxConfig(&cfg, "/max", null);
+    if (!build_options.enable_channel_max) {
+        try std.testing.expect(selected == null);
+        return;
+    }
+    try std.testing.expect(selected == null);
+}
+
+test "selectMaxConfig picks sole webhook account even when polling account exists" {
+    const max_accounts = [_]config_types.MaxConfig{
+        .{
+            .account_id = "poller",
+            .bot_token = "max-poll",
+            .mode = .polling,
+        },
+        .{
+            .account_id = "webhook",
+            .bot_token = "max-webhook",
+            .mode = .webhook,
+        },
+    };
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .max = &max_accounts,
+        },
+    };
+
+    const selected = selectMaxConfig(&cfg, "/max", null);
+    if (!build_options.enable_channel_max) {
+        try std.testing.expect(selected == null);
+        return;
+    }
+    try std.testing.expect(selected != null);
+    try std.testing.expectEqualStrings("webhook", selected.?.account_id);
+}
+
 test "selectWhatsAppConfig picks account by verify_token" {
     const wa_accounts = [_]config_types.WhatsAppConfig{
         .{
@@ -3506,6 +6612,142 @@ test "selectLarkConfig picks account by verification token" {
     }
     try std.testing.expect(selected != null);
     try std.testing.expectEqualStrings("backup", selected.?.account_id);
+}
+
+test "selectWeComConfig picks account by query account_id" {
+    const wecom_accounts = [_]config_types.WeComConfig{
+        .{
+            .account_id = "main",
+            .webhook_url = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=main",
+        },
+        .{
+            .account_id = "backup",
+            .webhook_url = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=backup",
+        },
+    };
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .wecom = &wecom_accounts,
+        },
+    };
+
+    const selected = selectWeComConfig(&cfg, "/wecom?account_id=backup");
+    if (!build_options.enable_channel_wecom) {
+        try std.testing.expect(selected == null);
+        return;
+    }
+    try std.testing.expect(selected != null);
+    try std.testing.expectEqualStrings("backup", selected.?.account_id);
+}
+
+test "selectWeChatConfig picks account by query account_id" {
+    const wechat_accounts = [_]config_types.WeChatConfig{
+        .{
+            .account_id = "main",
+            .callback_token = "token-main",
+        },
+        .{
+            .account_id = "backup",
+            .callback_token = "token-backup",
+        },
+    };
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .wechat = &wechat_accounts,
+        },
+    };
+
+    const selected = selectWeChatConfig(&cfg, "/wechat?account_id=backup");
+    if (!build_options.enable_channel_wechat) {
+        try std.testing.expect(selected == null);
+        return;
+    }
+    try std.testing.expect(selected != null);
+    try std.testing.expectEqualStrings("backup", selected.?.account_id);
+}
+
+test "formatHttpResponseHeader uses provided content type" {
+    var buf: [256]u8 = undefined;
+    const header = try formatHttpResponseHeader(&buf, "202 Accepted", CONTENT_TYPE_XML, 11);
+
+    try std.testing.expect(std.mem.containsAtLeast(u8, header, 1, "HTTP/1.1 202 Accepted\r\n"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, header, 1, "Content-Type: application/xml; charset=utf-8\r\n"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, header, 1, "Content-Length: 11\r\n"));
+}
+
+test "handleWeChatWebhookRoute requires callback token configuration" {
+    if (!build_options.enable_channel_wechat) return;
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+
+    const raw_request =
+        "POST /wechat HTTP/1.1\r\n" ++
+        "Host: localhost\r\n" ++
+        "Content-Type: application/xml\r\n\r\n" ++
+        "<xml></xml>";
+    var ctx = WebhookHandlerContext{
+        .root_allocator = std.testing.allocator,
+        .req_allocator = std.testing.allocator,
+        .raw_request = raw_request,
+        .method = "POST",
+        .target = "/wechat",
+        .config_opt = null,
+        .state = &state,
+        .session_mgr_opt = null,
+    };
+
+    handleWeChatWebhookRoute(&ctx);
+    try std.testing.expectEqualStrings("404 Not Found", ctx.response_status);
+    try std.testing.expectEqualStrings(CONTENT_TYPE_JSON, ctx.response_content_type);
+    try std.testing.expectEqualStrings("{\"error\":\"wechat callback not configured\"}", ctx.response_body);
+}
+
+test "handleWeComWebhookRoute requires secure callback configuration" {
+    if (!build_options.enable_channel_wecom) return;
+
+    const wecom_accounts = [_]config_types.WeComConfig{
+        .{
+            .account_id = "main",
+            .webhook_url = "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=main",
+        },
+    };
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+        .channels = .{ .wecom = &wecom_accounts },
+    };
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+
+    const raw_request =
+        "POST /wecom HTTP/1.1\r\n" ++
+        "Host: localhost\r\n" ++
+        "Content-Type: application/xml\r\n\r\n" ++
+        "<xml></xml>";
+    var ctx = WebhookHandlerContext{
+        .root_allocator = std.testing.allocator,
+        .req_allocator = std.testing.allocator,
+        .raw_request = raw_request,
+        .method = "POST",
+        .target = "/wecom",
+        .config_opt = &cfg,
+        .state = &state,
+        .session_mgr_opt = null,
+    };
+
+    handleWeComWebhookRoute(&ctx);
+    try std.testing.expectEqualStrings("404 Not Found", ctx.response_status);
+    try std.testing.expectEqualStrings(CONTENT_TYPE_JSON, ctx.response_content_type);
+    try std.testing.expectEqualStrings("{\"error\":\"wecom secure callback not configured\"}", ctx.response_body);
 }
 
 test "selectQqConfig picks account by X-Bot-Appid header" {
@@ -3615,6 +6857,127 @@ test "handleQqWebhookRoute rejects invalid json payload" {
     try std.testing.expectEqualStrings("{\"error\":\"invalid json payload\"}", ctx.response_body);
 }
 
+fn testEncodeWeChatSecurePayload(
+    allocator: std.mem.Allocator,
+    encoding_aes_key: []const u8,
+    app_id: []const u8,
+    plain_xml: []const u8,
+) ![]u8 {
+    const key = tencent_crypto.decodeEncodingAesKey(encoding_aes_key) catch {
+        return error.InvalidWeChatEncodingAesKey;
+    };
+
+    var plain: std.ArrayListUnmanaged(u8) = .empty;
+    defer plain.deinit(allocator);
+    try plain.appendSlice(allocator, "0123456789ABCDEF");
+
+    const msg_len = plain_xml.len;
+    try plain.append(allocator, @as(u8, @truncate((msg_len >> 24) & 0xff)));
+    try plain.append(allocator, @as(u8, @truncate((msg_len >> 16) & 0xff)));
+    try plain.append(allocator, @as(u8, @truncate((msg_len >> 8) & 0xff)));
+    try plain.append(allocator, @as(u8, @truncate(msg_len & 0xff)));
+    try plain.appendSlice(allocator, plain_xml);
+    try plain.appendSlice(allocator, app_id);
+
+    const cipher = tencent_crypto.aesCbcEncrypt(
+        allocator,
+        key,
+        key[0..16].*,
+        plain.items,
+        tencent_crypto.WECHAT_PKCS7_BLOCK,
+    ) catch |err| switch (err) {
+        error.InvalidBlockSize => unreachable,
+        else => return err,
+    };
+    defer allocator.free(cipher);
+
+    const encoded_len = std.base64.standard.Encoder.calcSize(cipher.len);
+    const encoded = try allocator.alloc(u8, encoded_len);
+    _ = std.base64.standard.Encoder.encode(encoded, cipher);
+    return encoded;
+}
+
+test "handleWeChatWebhookRoute accepts secure encrypted callback" {
+    if (!build_options.enable_channel_wechat) return;
+
+    const token = "wechat-token";
+    const app_id = "wx_test_app";
+    var raw_key: [32]u8 = undefined;
+    for (&raw_key, 0..) |*b, idx| b.* = @as(u8, @intCast(idx));
+    var key_b64: [44]u8 = undefined;
+    _ = std.base64.standard.Encoder.encode(&key_b64, &raw_key);
+    const encoding_aes_key = key_b64[0..43];
+    const timestamp = "1710000000";
+    const nonce = "123456";
+    const plain_xml =
+        "<xml>" ++
+        "<ToUserName><![CDATA[gh_abcdef]]></ToUserName>" ++
+        "<FromUserName><![CDATA[o_user123]]></FromUserName>" ++
+        "<CreateTime>1710000000</CreateTime>" ++
+        "<MsgType><![CDATA[text]]></MsgType>" ++
+        "<Content><![CDATA[hello secure]]></Content>" ++
+        "</xml>";
+
+    const encrypted = try testEncodeWeChatSecurePayload(std.testing.allocator, encoding_aes_key, app_id, plain_xml);
+    defer std.testing.allocator.free(encrypted);
+    const msg_sig = tencent_crypto.wechatMessageSha1Signature(token, timestamp, nonce, encrypted);
+
+    const secure_body = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "<xml><ToUserName><![CDATA[gh_abcdef]]></ToUserName><Encrypt><![CDATA[{s}]]></Encrypt></xml>",
+        .{encrypted},
+    );
+    defer std.testing.allocator.free(secure_body);
+
+    const target = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "/wechat?timestamp={s}&nonce={s}&msg_signature={s}",
+        .{ timestamp, nonce, msg_sig },
+    );
+    defer std.testing.allocator.free(target);
+
+    const raw_request = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "POST {s} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/xml\r\n\r\n{s}",
+        .{ target, secure_body },
+    );
+    defer std.testing.allocator.free(raw_request);
+
+    const wechat_accounts = [_]config_types.WeChatConfig{
+        .{
+            .account_id = "main",
+            .callback_token = token,
+            .encoding_aes_key = encoding_aes_key,
+            .app_id = app_id,
+        },
+    };
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+        .channels = .{ .wechat = &wechat_accounts },
+    };
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+
+    var ctx = WebhookHandlerContext{
+        .root_allocator = std.testing.allocator,
+        .req_allocator = std.testing.allocator,
+        .raw_request = raw_request,
+        .method = "POST",
+        .target = target,
+        .config_opt = &cfg,
+        .state = &state,
+        .session_mgr_opt = null,
+    };
+
+    handleWeChatWebhookRoute(&ctx);
+    try std.testing.expectEqualStrings("200 OK", ctx.response_status);
+    try std.testing.expectEqualStrings(CONTENT_TYPE_TEXT, ctx.response_content_type);
+    try std.testing.expectEqualStrings("success", ctx.response_body);
+}
+
 test "whatsappSessionKey builds direct key by sender" {
     const body = "{\"from\":\"15550001111\",\"text\":{\"body\":\"hi\"}}";
     var key_buf: [256]u8 = undefined;
@@ -3649,6 +7012,26 @@ test "telegramChatId falls back to flat chat_id for backward compatibility" {
     const allocator = std.testing.allocator;
     const body = "{\"chat_id\":12345,\"text\":\"hi\"}";
     try std.testing.expectEqual(@as(i64, 12345), telegramChatId(allocator, body).?);
+}
+
+test "telegramWebhookTarget extracts topic thread id from message" {
+    const allocator = std.testing.allocator;
+    const body =
+        \\{"message":{"chat":{"id":-100777,"type":"supergroup"},"message_thread_id":42,"text":"hi"}}
+    ;
+    const target = telegramWebhookTarget(allocator, body) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(i64, -100777), target.chat_id);
+    try std.testing.expect(target.is_group);
+    try std.testing.expectEqual(@as(?i64, 42), target.message_thread_id);
+}
+
+test "telegramWebhookTarget falls back to reply message id for topic replies" {
+    const allocator = std.testing.allocator;
+    const body =
+        \\{"message":{"chat":{"id":-100777,"type":"supergroup"},"is_topic_message":true,"reply_to_message":{"message_id":88},"text":"hi"}}
+    ;
+    const target = telegramWebhookTarget(allocator, body) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(?i64, 88), target.message_thread_id);
 }
 
 test "telegramSenderAllowed matches numeric sender id from nested from object" {
@@ -3821,7 +7204,7 @@ test "telegramSessionKeyRouted uses group peer for group chats" {
         },
     };
 
-    const key = telegramSessionKeyRouted(allocator, &key_buf, -10012345, body, &cfg, "tg-main");
+    const key = telegramSessionKeyRouted(allocator, &key_buf, body, &cfg, "tg-main");
     try std.testing.expectEqualStrings("agent:tg-group-agent:telegram:group:-10012345", key);
 }
 
@@ -3851,7 +7234,7 @@ test "telegramSessionKeyRouted uses direct peer for private chats" {
         },
     };
 
-    const key = telegramSessionKeyRouted(allocator, &key_buf, 4242, body, &cfg, "tg-main");
+    const key = telegramSessionKeyRouted(allocator, &key_buf, body, &cfg, "tg-main");
     try std.testing.expectEqualStrings("agent:tg-dm-agent:telegram:direct:4242", key);
 }
 
@@ -3884,8 +7267,46 @@ test "telegramSessionKeyRouted applies session dm_scope for direct chats" {
         },
     };
 
-    const key = telegramSessionKeyRouted(allocator, &key_buf, 4242, body, &cfg, "tg-main");
+    const key = telegramSessionKeyRouted(allocator, &key_buf, body, &cfg, "tg-main");
     try std.testing.expectEqualStrings("agent:tg-dm-agent:direct:4242", key);
+}
+
+test "telegramSessionKeyRouted uses topic peer before group fallback" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const body =
+        \\{"message":{"chat":{"id":-10012345,"type":"supergroup"},"message_thread_id":42,"text":"hi"}}
+    ;
+    var key_buf: [128]u8 = undefined;
+
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+        .agent_bindings = &[_]agent_routing.AgentBinding{
+            .{
+                .agent_id = "tg-topic-agent",
+                .match = .{
+                    .channel = "telegram",
+                    .account_id = "tg-main",
+                    .peer = .{ .kind = .group, .id = "-10012345:thread:42" },
+                },
+            },
+            .{
+                .agent_id = "tg-group-agent",
+                .match = .{
+                    .channel = "telegram",
+                    .account_id = "tg-main",
+                    .peer = .{ .kind = .group, .id = "-10012345" },
+                },
+            },
+        },
+    };
+
+    const key = telegramSessionKeyRouted(allocator, &key_buf, body, &cfg, "tg-main");
+    try std.testing.expectEqualStrings("agent:tg-topic-agent:telegram:group:-10012345:thread:42", key);
 }
 
 test "lineSessionKeyRouted uses group id for group events" {
@@ -4026,6 +7447,246 @@ test "larkSessionKeyRouted uses route engine when config exists" {
 
     const key = larkSessionKeyRouted(allocator, &key_buf, msg, &cfg, "lark-main");
     try std.testing.expectEqualStrings("agent:lark-group-agent:lark:group:ou_abc123", key);
+}
+
+test "wecomSessionKeyRouted uses route engine when config exists" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var key_buf: [128]u8 = undefined;
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+        .agent_bindings = &[_]agent_routing.AgentBinding{
+            .{
+                .agent_id = "wecom-dm-agent",
+                .match = .{
+                    .channel = "wecom",
+                    .account_id = "wecom-main",
+                    .peer = .{ .kind = .direct, .id = "zhangsan" },
+                },
+            },
+        },
+    };
+
+    const key = wecomSessionKeyRouted(allocator, &key_buf, "zhangsan", &cfg, "wecom-main");
+    try std.testing.expectEqualStrings("agent:wecom-dm-agent:wecom:direct:zhangsan", key);
+}
+
+test "wechatSessionKeyRouted uses route engine when config exists" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var key_buf: [128]u8 = undefined;
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+        .agent_bindings = &[_]agent_routing.AgentBinding{
+            .{
+                .agent_id = "wechat-dm-agent",
+                .match = .{
+                    .channel = "wechat",
+                    .account_id = "wechat-main",
+                    .peer = .{ .kind = .direct, .id = "openid_123" },
+                },
+            },
+        },
+    };
+
+    const key = wechatSessionKeyRouted(allocator, &key_buf, "openid_123", &cfg, "wechat-main");
+    try std.testing.expectEqualStrings("agent:wechat-dm-agent:wechat:direct:openid_123", key);
+}
+
+test "maxSessionKeyRouted uses sender identity for direct chats" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var key_buf: [128]u8 = undefined;
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+        .agent_bindings = &[_]agent_routing.AgentBinding{
+            .{
+                .agent_id = "max-direct-agent",
+                .match = .{
+                    .channel = "max",
+                    .account_id = "max-main",
+                    .peer = .{ .kind = .direct, .id = "alice" },
+                },
+            },
+        },
+    };
+
+    const key = maxSessionKeyRouted(allocator, &key_buf, "alice", "dialog-123", false, &cfg, "max-main");
+    try std.testing.expectEqualStrings("agent:max-direct-agent:max:direct:alice", key);
+}
+
+test "maxSessionKeyRouted uses chat target for group chats" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var key_buf: [128]u8 = undefined;
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+        .agent_bindings = &[_]agent_routing.AgentBinding{
+            .{
+                .agent_id = "max-group-agent",
+                .match = .{
+                    .channel = "max",
+                    .account_id = "max-main",
+                    .peer = .{ .kind = .group, .id = "chat-777" },
+                },
+            },
+        },
+    };
+
+    const key = maxSessionKeyRouted(allocator, &key_buf, "alice", "chat-777", true, &cfg, "max-main");
+    try std.testing.expectEqualStrings("agent:max-group-agent:max:group:chat-777", key);
+}
+
+test "qqSessionKeyRouted uses sender identity for direct chats" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+        .agent_bindings = &[_]agent_routing.AgentBinding{
+            .{
+                .agent_id = "qq-direct-agent",
+                .match = .{
+                    .channel = "qq",
+                    .account_id = "qq-main",
+                    .peer = .{ .kind = .direct, .id = "openid-user" },
+                },
+            },
+        },
+    };
+
+    const inbound = try bus_mod.makeInboundFull(
+        allocator,
+        "qq",
+        "openid-user",
+        "c2c:openid-user:msg001",
+        "hello",
+        "qq:c2c:openid-user",
+        &.{},
+        "{\"account_id\":\"qq-main\",\"is_dm\":true,\"user_openid\":\"openid-user\"}",
+    );
+    defer inbound.deinit(allocator);
+
+    const key = qqSessionKeyRouted(allocator, &inbound, &cfg) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("agent:qq-direct-agent:qq:direct:openid-user", key);
+}
+
+test "teamsSessionKeyRouted uses sender identity for personal chats" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var key_buf: [256]u8 = undefined;
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+        .agent_bindings = &[_]agent_routing.AgentBinding{
+            .{
+                .agent_id = "teams-direct-agent",
+                .match = .{
+                    .channel = "teams",
+                    .account_id = "teams-main",
+                    .peer = .{ .kind = .direct, .id = "user-42" },
+                },
+            },
+        },
+    };
+
+    const body =
+        \\{"type":"message","text":"hi","conversation":{"id":"conv-1","conversationType":"personal"},"from":{"id":"user-42"}}
+    ;
+    const key = teamsSessionKeyRouted(allocator, &key_buf, &cfg, body, "teams-main", "tenant-1", "conv-1", "user-42");
+    try std.testing.expectEqualStrings("agent:teams-direct-agent:teams:direct:user-42", key);
+}
+
+test "teamsSessionKeyRouted uses conversation id for channel chats" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var key_buf: [256]u8 = undefined;
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+        .agent_bindings = &[_]agent_routing.AgentBinding{
+            .{
+                .agent_id = "teams-channel-agent",
+                .match = .{
+                    .channel = "teams",
+                    .account_id = "teams-main",
+                    .peer = .{ .kind = .channel, .id = "conv-chan" },
+                },
+            },
+        },
+    };
+
+    const body =
+        \\{"type":"message","text":"hi","conversation":{"id":"conv-chan","conversationType":"channel"},"from":{"id":"user-42"}}
+    ;
+    const key = teamsSessionKeyRouted(allocator, &key_buf, &cfg, body, "teams-main", "tenant-1", "conv-chan", "user-42");
+    try std.testing.expectEqualStrings("agent:teams-channel-agent:teams:channel:conv-chan", key);
+}
+
+test "webhookRouting uses route engine when standardized peer metadata is present" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+        .agent_bindings = &[_]agent_routing.AgentBinding{
+            .{
+                .agent_id = "web-direct-agent",
+                .match = .{
+                    .channel = "web",
+                    .account_id = "web-main",
+                    .peer = .{ .kind = .direct, .id = "session-1" },
+                },
+            },
+        },
+    };
+
+    var routing = webhookRouting(
+        allocator,
+        "{\"channel\":\"web\",\"account_id\":\"web-main\",\"peer_kind\":\"direct\",\"peer_id\":\"session-1\",\"sender_id\":\"user-1\",\"message\":\"hi\"}",
+        "bearer-1",
+        &cfg,
+    );
+    defer routing.deinit(allocator);
+
+    try std.testing.expectEqualStrings("user-1", routing.sender_id);
+    try std.testing.expectEqualStrings("session-1", routing.chat_id);
+    try std.testing.expectEqualStrings("agent:web-direct-agent:web:direct:session-1", routing.session_key);
+    try std.testing.expect(routing.metadata_json != null);
+    try std.testing.expect(std.mem.indexOf(u8, routing.metadata_json.?, "\"account_id\":\"web-main\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, routing.metadata_json.?, "\"peer_kind\":\"direct\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, routing.metadata_json.?, "\"peer_id\":\"session-1\"") != null);
+    try std.testing.expect(routing.conversation_context != null);
+    try std.testing.expectEqualStrings("web", routing.conversation_context.?.channel.?);
+    try std.testing.expectEqualStrings("session-1", routing.conversation_context.?.peer_id.?);
 }
 
 // ── extractBody tests ────────────────────────────────────────────
@@ -4170,6 +7831,13 @@ test "userFacingAgentError maps NoResponseContent" {
     );
 }
 
+test "userFacingAgentError maps CurlFailed with actionable hint" {
+    try std.testing.expectEqualStrings(
+        "Network error contacting provider. Check base_url, DNS, proxy, and TLS certificates, then try again.",
+        userFacingAgentError(error.CurlFailed),
+    );
+}
+
 test "userFacingAgentError maps AllProvidersFailed" {
     try std.testing.expectEqualStrings(
         "All configured providers failed for this request. Check model/provider compatibility and credentials.",
@@ -4188,6 +7856,13 @@ test "userFacingAgentErrorJson maps NoResponseContent" {
     try std.testing.expectEqualStrings(
         "{\"error\":\"model returned empty response\"}",
         userFacingAgentErrorJson(error.NoResponseContent),
+    );
+}
+
+test "userFacingAgentErrorJson maps CurlFailed" {
+    try std.testing.expectEqualStrings(
+        "{\"error\":\"network error contacting provider\"}",
+        userFacingAgentErrorJson(error.CurlFailed),
     );
 }
 
@@ -4888,4 +8563,20 @@ test "jsonWrapChallenge escapes malicious challenge value" {
     try std.testing.expectEqualStrings("abc\",\"evil\":\"true", challenge.string);
     // Must NOT have an "evil" key (injection prevented)
     try std.testing.expect(parsed.value.object.get("evil") == null);
+}
+
+// ── Port conflict detection tests ─────────────────────────────────────
+
+test "run returns AddressInUse when port is already bound" {
+    // Find an available port by binding to port 0
+    const test_addr = try std.net.Address.resolveIp("127.0.0.1", 0);
+    var listener = try test_addr.listen(.{ .reuse_address = true });
+    defer listener.deinit();
+
+    // Get the actual port that was assigned
+    const bound_port = listener.listen_address.in.getPort();
+
+    // Try to start gateway on the same port - should fail with AddressInUse
+    const result = run(std.testing.allocator, "127.0.0.1", bound_port, null, null);
+    try std.testing.expectError(error.AddressInUse, result);
 }

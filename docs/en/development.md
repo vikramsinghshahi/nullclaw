@@ -27,6 +27,7 @@ This page is for contributors. The goal is to help you set up the repo, make a f
 - Development and testing are pinned to **Zig 0.15.2**.
 - Read `AGENTS.md` before code changes.
 - Read `CLAUDE.md` if you need more project context, validation rules, or subsystem guidance.
+- If you use the repository flake, both `nix build` and `nix develop` are pinned to **Zig 0.15.2**.
 
 Check your Zig version first:
 
@@ -62,7 +63,7 @@ Notes:
 - `channels`: limit which channel implementations are compiled in
 - `engines`: limit memory engines in the build
 - `target`: cross-compile target triple
-- `version`: override the CalVer version string
+- `version`: override the embedded version string (`dev` by default; release workflow injects the git tag)
 
 ## Recommended Workflow
 

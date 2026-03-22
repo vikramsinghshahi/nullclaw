@@ -45,6 +45,18 @@ This page groups the NullClaw CLI by task so you can find the right command quic
 | `nullclaw agent -m "..."` | Run a single prompt |
 | `nullclaw agent` | Start interactive chat mode |
 
+### Interactive model routing
+
+- In `nullclaw agent`, `/model` shows the current model plus configured routing/fallback status.
+- `/config reload` hot reloads supported keys from `config.json` (including agent profiles).
+- When auto-routing is configured, `/model` also shows the last auto-route decision and why it was chosen.
+- If a routed provider is temporarily rate-limited or out of credits, `/model` shows that route as degraded until its cooldown expires.
+- `/model` also lists configured auto routes with their `cost_class` and `quota_class` metadata.
+- `/model <provider/model>` pins the current session to that model and disables automatic routing.
+- `/model auto` clears the user pin, restores the configured default model, and re-enables `model_routes` for later turns in the same session.
+- If no `model_routes` are configured, `/model auto` still clears the pin and returns the session to the configured default model.
+- Starting `nullclaw agent` with `--model` or `--provider` also pins the run and bypasses `model_routes`.
+
 ## Runtime and operations
 
 | Command | Purpose |
@@ -91,7 +103,7 @@ Notes:
 |---|---|
 | `nullclaw cron list` | List scheduled tasks |
 | `nullclaw cron add "0 * * * *" "command"` | Add a recurring shell task |
-| `nullclaw cron add-agent "0 * * * *" "prompt" --model <model>` | Add a recurring agent task |
+| `nullclaw cron add-agent "0 * * * *" "prompt" --model <model> [--announce] [--channel <name>] [--account <id>] [--to <id>]` | Add a recurring agent task |
 | `nullclaw cron once 10m "command"` | Add a one-shot delayed shell task |
 | `nullclaw cron once-agent 10m "prompt" --model <model>` | Add a one-shot delayed agent task |
 | `nullclaw cron run <id>` | Run a task immediately |
@@ -108,6 +120,13 @@ Notes:
 | `nullclaw skills install <source>` | Install from a GitHub URL or local path |
 | `nullclaw skills remove <name>` | Remove a skill |
 | `nullclaw skills info <name>` | Show skill metadata |
+
+### `history`
+
+| Command | Purpose |
+|---|---|
+| `nullclaw history list [--limit N] [--offset N] [--json]` | List conversation sessions |
+| `nullclaw history show <session_id> [--limit N] [--offset N] [--json]` | Show messages for a session |
 
 ## Data, models, and workspace
 

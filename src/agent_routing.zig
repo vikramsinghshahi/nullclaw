@@ -119,6 +119,24 @@ pub fn resolveLinkedPeerId(
     return peer_id;
 }
 
+/// Build a deterministic synthetic agent id for direct-peer auto-provision.
+/// Format: `peer-{16 hex chars}`.
+fn buildAutoProvisionedAgentId(
+    allocator: std.mem.Allocator,
+    channel: []const u8,
+    account_id: []const u8,
+    peer_id: []const u8,
+) ![]u8 {
+    var hasher = std.hash.Wyhash.init(0);
+    hasher.update(channel);
+    hasher.update("\x1f");
+    hasher.update(account_id);
+    hasher.update("\x1f");
+    hasher.update(peer_id);
+    const digest = hasher.final();
+    return std.fmt.allocPrint(allocator, "peer-{x:0>16}", .{digest});
+}
+
 /// Build a DM-scope-aware session key.
 /// Returns owned slice; caller must free with the same allocator.
 pub fn buildSessionKey(
@@ -282,6 +300,39 @@ fn hasMatchingRole(binding_roles: []const []const u8, member_roles: []const []co
     return false;
 }
 
+fn firstMatchingBinding(
+    candidates: []const AgentBinding,
+    input: RouteInput,
+    check_peer: ?PeerRef,
+    matched_by: MatchedBy,
+) ?AgentBinding {
+    // Within the same routing tier, prefer bindings scoped to the current
+    // account before broader unscoped fallbacks.
+    for ([_]bool{ true, false }) |prefer_account_scoped| {
+        for (candidates) |binding| {
+            if (prefer_account_scoped != (binding.match.account_id != null)) continue;
+
+            const matches = switch (matched_by) {
+                .peer, .parent_peer => binding.match.peer != null and allConstraintsMatch(binding, input, check_peer),
+                .guild_roles => binding.match.guild_id != null and
+                    binding.match.roles.len > 0 and
+                    allConstraintsMatch(binding, input, check_peer),
+                .guild => binding.match.guild_id != null and
+                    binding.match.roles.len == 0 and
+                    allConstraintsMatch(binding, input, check_peer),
+                .team => binding.match.team_id != null and allConstraintsMatch(binding, input, check_peer),
+                .account => binding.match.account_id != null and isAccountOnly(binding),
+                .channel_only => isChannelOnly(binding),
+                .default => false,
+            };
+
+            if (matches) return binding;
+        }
+    }
+
+    return null;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Route resolution
 // ═══════════════════════════════════════════════════════════════════════════
@@ -309,67 +360,49 @@ pub fn resolveRoute(
 
     // Tier 1: peer match — binding has a peer constraint that matches input.peer
     if (input.peer) |ip| {
-        for (candidates.items) |b| {
-            if (b.match.peer != null and allConstraintsMatch(b, input, ip)) {
-                return buildRoute(allocator, b.agent_id, input, .peer);
-            }
+        if (firstMatchingBinding(candidates.items, input, ip, .peer)) |binding| {
+            return buildRoute(allocator, binding.agent_id, input, .peer);
         }
     }
 
     // Tier 2: parent_peer match — binding peer matches input.parent_peer
     if (input.parent_peer) |pp| {
         if (pp.id.len > 0) {
-            for (candidates.items) |b| {
-                if (b.match.peer != null and allConstraintsMatch(b, input, pp)) {
-                    return buildRoute(allocator, b.agent_id, input, .parent_peer);
-                }
+            if (firstMatchingBinding(candidates.items, input, pp, .parent_peer)) |binding| {
+                return buildRoute(allocator, binding.agent_id, input, .parent_peer);
             }
         }
     }
 
     // Tier 3: guild_id + roles match
     if (input.guild_id != null and input.member_role_ids.len > 0) {
-        for (candidates.items) |b| {
-            if (b.match.guild_id != null and b.match.roles.len > 0 and
-                allConstraintsMatch(b, input, input.peer))
-            {
-                return buildRoute(allocator, b.agent_id, input, .guild_roles);
-            }
+        if (firstMatchingBinding(candidates.items, input, input.peer, .guild_roles)) |binding| {
+            return buildRoute(allocator, binding.agent_id, input, .guild_roles);
         }
     }
 
     // Tier 4: guild_id only (no roles on binding)
     if (input.guild_id != null) {
-        for (candidates.items) |b| {
-            if (b.match.guild_id != null and b.match.roles.len == 0 and
-                allConstraintsMatch(b, input, input.peer))
-            {
-                return buildRoute(allocator, b.agent_id, input, .guild);
-            }
+        if (firstMatchingBinding(candidates.items, input, input.peer, .guild)) |binding| {
+            return buildRoute(allocator, binding.agent_id, input, .guild);
         }
     }
 
     // Tier 5: team_id match
     if (input.team_id != null) {
-        for (candidates.items) |b| {
-            if (b.match.team_id != null and allConstraintsMatch(b, input, input.peer)) {
-                return buildRoute(allocator, b.agent_id, input, .team);
-            }
+        if (firstMatchingBinding(candidates.items, input, input.peer, .team)) |binding| {
+            return buildRoute(allocator, binding.agent_id, input, .team);
         }
     }
 
     // Tier 6: account only (channel + account_id, no peer/guild/team/roles)
-    for (candidates.items) |b| {
-        if (b.match.account_id != null and isAccountOnly(b)) {
-            return buildRoute(allocator, b.agent_id, input, .account);
-        }
+    if (firstMatchingBinding(candidates.items, input, input.peer, .account)) |binding| {
+        return buildRoute(allocator, binding.agent_id, input, .account);
     }
 
     // Tier 7: channel only (no account_id/peer/guild/team/roles)
-    for (candidates.items) |b| {
-        if (isChannelOnly(b)) {
-            return buildRoute(allocator, b.agent_id, input, .channel_only);
-        }
+    if (firstMatchingBinding(candidates.items, input, input.peer, .channel_only)) |binding| {
+        return buildRoute(allocator, binding.agent_id, input, .channel_only);
     }
 
     // No match — use default agent.
@@ -389,16 +422,41 @@ pub fn resolveRouteWithSession(
     var route = try resolveRoute(allocator, input, bindings, agents);
     errdefer allocator.free(route.main_session_key);
 
+    const auto_provision_candidate = blk: {
+        if (!session.auto_provision_direct_agents) break :blk null;
+        if (route.matched_by != .default) break :blk null;
+        const peer = input.peer orelse break :blk null;
+        if (peer.kind != .direct or peer.id.len == 0) break :blk null;
+        break :blk peer.id;
+    };
+
+    const session_agent_id = if (auto_provision_candidate) |peer_id| blk: {
+        const synthetic = try buildAutoProvisionedAgentId(
+            allocator,
+            input.channel,
+            input.account_id,
+            peer_id,
+        );
+        defer allocator.free(synthetic);
+        break :blk try allocator.dupe(u8, synthetic);
+    } else try allocator.dupe(u8, route.agent_id);
+    defer allocator.free(session_agent_id);
+
+    allocator.free(route.main_session_key);
+    route.main_session_key = try buildMainSessionKey(allocator, session_agent_id);
     allocator.free(route.session_key);
     route.session_key = try buildSessionKeyWithScope(
         allocator,
-        route.agent_id,
+        session_agent_id,
         input.channel,
         input.peer,
         session.dm_scope,
         input.account_id,
         session.identity_links,
     );
+    if (auto_provision_candidate != null) {
+        route.agent_id = route.main_session_key["agent:".len .. route.main_session_key.len - ":main".len];
+    }
     return route;
 }
 
@@ -1013,6 +1071,38 @@ test "resolveRoute — peer binding wins over account binding" {
     try std.testing.expectEqual(MatchedBy.peer, route.matched_by);
 }
 
+test "resolveRoute — account scoped peer binding beats unscoped peer fallback regardless of order" {
+    const allocator = std.testing.allocator;
+    const bindings = [_]AgentBinding{
+        .{
+            .agent_id = "fallback",
+            .match = .{
+                .channel = "telegram",
+                .peer = .{ .kind = .group, .id = "-100123:thread:42" },
+            },
+        },
+        .{
+            .agent_id = "exact",
+            .match = .{
+                .channel = "telegram",
+                .account_id = "main",
+                .peer = .{ .kind = .group, .id = "-100123:thread:42" },
+            },
+        },
+    };
+
+    const route = try resolveRoute(allocator, .{
+        .channel = "telegram",
+        .account_id = "main",
+        .peer = .{ .kind = .group, .id = "-100123:thread:42" },
+    }, &bindings, &.{});
+    defer allocator.free(route.session_key);
+    defer allocator.free(route.main_session_key);
+
+    try std.testing.expectEqualStrings("exact", route.agent_id);
+    try std.testing.expectEqual(MatchedBy.peer, route.matched_by);
+}
+
 test "resolveRoute — missing accountId in binding matches only that account" {
     const allocator = std.testing.allocator;
     const bindings = [_]AgentBinding{.{
@@ -1452,4 +1542,55 @@ test "resolveLinkedPeerId — multiple links, first match wins" {
 
 test "resolveLinkedPeerId — empty links returns original" {
     try std.testing.expectEqualStrings("user42", resolveLinkedPeerId("user42", &.{}));
+}
+
+test "resolveRouteWithSession auto-provisions direct peer into synthetic agent session key" {
+    const allocator = std.testing.allocator;
+    const input = RouteInput{
+        .channel = "whatsapp_web",
+        .account_id = "default",
+        .peer = .{ .kind = .direct, .id = "5511987654321" },
+    };
+    const session_cfg = config_types.SessionConfig{
+        .auto_provision_direct_agents = true,
+    };
+
+    const route = try resolveRouteWithSession(allocator, input, &.{}, &.{}, session_cfg);
+    defer allocator.free(route.session_key);
+    defer allocator.free(route.main_session_key);
+
+    try std.testing.expect(std.mem.startsWith(u8, route.agent_id, "peer-"));
+    try std.testing.expect(std.mem.startsWith(u8, route.main_session_key, "agent:peer-"));
+    try std.testing.expect(std.mem.endsWith(u8, route.main_session_key, ":main"));
+    try std.testing.expect(std.mem.startsWith(u8, route.session_key, "agent:peer-"));
+    try std.testing.expect(std.mem.indexOf(u8, route.session_key, ":whatsapp_web:direct:5511987654321") != null);
+}
+
+test "resolveRouteWithSession does not auto-provision when binding matched" {
+    const allocator = std.testing.allocator;
+    const input = RouteInput{
+        .channel = "telegram",
+        .account_id = "default",
+        .peer = .{ .kind = .direct, .id = "4242" },
+    };
+    const bindings = [_]AgentBinding{
+        .{
+            .agent_id = "tg-dm-agent",
+            .match = .{
+                .channel = "telegram",
+                .peer = .{ .kind = .direct, .id = "4242" },
+            },
+        },
+    };
+    const session_cfg = config_types.SessionConfig{
+        .auto_provision_direct_agents = true,
+    };
+
+    const route = try resolveRouteWithSession(allocator, input, &bindings, &.{}, session_cfg);
+    defer allocator.free(route.session_key);
+    defer allocator.free(route.main_session_key);
+
+    try std.testing.expectEqualStrings("tg-dm-agent", route.agent_id);
+    try std.testing.expectEqualStrings("agent:tg-dm-agent:main", route.main_session_key);
+    try std.testing.expectEqualStrings("agent:tg-dm-agent:telegram:direct:4242", route.session_key);
 }

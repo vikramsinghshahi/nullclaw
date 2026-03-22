@@ -6,6 +6,7 @@
 //! - Device Authorization Grant flow (RFC 8628)
 
 const std = @import("std");
+const fs_compat = @import("fs_compat.zig");
 const platform = @import("platform.zig");
 const json_util = @import("json_util.zig");
 
@@ -116,7 +117,7 @@ pub fn saveCredential(allocator: std.mem.Allocator, provider: []const u8, token:
     defer allocator.free(dir_path);
 
     // Ensure directory exists
-    std.fs.cwd().makePath(dir_path) catch return error.CredentialWriteFailed;
+    fs_compat.makePath(dir_path) catch return error.CredentialWriteFailed;
 
     const file_path = try std.fs.path.join(allocator, &.{ dir_path, CRED_FILE });
     defer allocator.free(file_path);
@@ -190,7 +191,8 @@ pub fn saveCredential(allocator: std.mem.Allocator, provider: []const u8, token:
 }
 
 /// Load a credential for the given provider from ~/.nullclaw/auth.json.
-/// Returns null if the file is missing, the provider is not found, or the token is expired.
+/// Returns null if the file is missing, the provider is not found, or the token
+/// is expired and cannot be refreshed.
 pub fn loadCredential(allocator: std.mem.Allocator, provider: []const u8) !?OAuthToken {
     const home = platform.getHomeDir(allocator) catch return null;
     defer allocator.free(home);
@@ -253,7 +255,7 @@ pub fn loadCredential(allocator: std.mem.Allocator, provider: []const u8) !?OAut
     const token_type = try allocator.dupe(u8, token_type_raw);
     errdefer allocator.free(token_type);
 
-    if (expires_at != 0 and std.time.timestamp() + 300 >= expires_at) {
+    if (expires_at != 0 and std.time.timestamp() + 300 >= expires_at and refresh_token == null) {
         allocator.free(access_token);
         if (refresh_token) |rt| allocator.free(rt);
         allocator.free(token_type);

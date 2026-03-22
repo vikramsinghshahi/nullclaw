@@ -64,6 +64,7 @@ pub const WebChannel = struct {
     listen_address: []const u8,
     ws_path: []const u8,
     max_connections: u16,
+    max_handshake_size: u16,
     account_id: []const u8,
     configured_auth_token: ?[]const u8,
     allowed_origins: []const []const u8,
@@ -112,6 +113,14 @@ pub const WebChannel = struct {
 
     const WsServer = websocket.Server(WsHandler);
 
+    fn publicBindTokenRequiredLogMessage(message_auth_mode: MessageAuthMode) []const u8 {
+        return switch (message_auth_mode) {
+            .pairing => "WS connection rejected: token required for non-loopback bind; local pairing_request is loopback-only. Use /ws?token=<auth_token> (or Authorization header), keep listen=127.0.0.1, or use an SSH tunnel/reverse proxy.",
+            .token => "WS connection rejected: token required for non-loopback bind; use /ws?token=<auth_token> (or Authorization header).",
+            .invalid => "WS connection rejected: token required for non-loopback bind.",
+        };
+    }
+
     const vtable = root.Channel.VTable{
         .start = wsStart,
         .stop = wsStop,
@@ -119,6 +128,7 @@ pub const WebChannel = struct {
         .sendEvent = wsSendEvent,
         .name = wsName,
         .healthCheck = wsHealthCheck,
+        .supportsStreamingOutbound = wsSupportsStreamingOutbound,
     };
 
     pub fn initFromConfig(allocator: std.mem.Allocator, cfg: config_types.WebConfig) WebChannel {
@@ -127,6 +137,10 @@ pub const WebChannel = struct {
         else
             cfg.max_connections;
         const normalized_path = config_types.WebConfig.normalizePath(cfg.path);
+        const normalized_max_handshake_size: u16 = if (cfg.max_handshake_size == 0)
+            config_types.WebConfig.DEFAULT_MAX_HANDSHAKE_SIZE
+        else
+            cfg.max_handshake_size;
         return .{
             .allocator = allocator,
             .transport = parseTransport(cfg.transport),
@@ -134,6 +148,7 @@ pub const WebChannel = struct {
             .listen_address = cfg.listen,
             .ws_path = normalized_path,
             .max_connections = clamped_max_connections,
+            .max_handshake_size = normalized_max_handshake_size,
             .account_id = cfg.account_id,
             .configured_auth_token = cfg.auth_token,
             .allowed_origins = cfg.allowed_origins,
@@ -440,10 +455,8 @@ pub const WebChannel = struct {
             }
         } else if (self.relay_pairing_guard) |*guard| {
             if (guard.pairingCode()) |code| {
-                log.info("Web relay pairing code (one-time, {d}s TTL): {s}", .{
-                    self.relay_pairing_code_ttl_secs,
-                    code,
-                });
+                var pairing_log_buf: [160]u8 = undefined;
+                log.info("{s}", .{relayPairingLogMessage(&pairing_log_buf, self.relay_pairing_code_ttl_secs, null, code)});
             }
         }
     }
@@ -461,6 +474,24 @@ pub const WebChannel = struct {
         return self.relayPairingCodeExpiredLocked();
     }
 
+    fn relayPairingLogMessage(buf: []u8, ttl_secs: u32, reason: ?[]const u8, code: []const u8) []const u8 {
+        _ = code;
+        if (reason) |why| {
+            return std.fmt.bufPrint(buf, "Web relay pairing code rotated ({s}, one-time, {d}s TTL, value hidden)", .{
+                why,
+                ttl_secs,
+            }) catch "Web relay pairing code rotated (value hidden)";
+        }
+        return std.fmt.bufPrint(buf, "Web relay pairing code generated (one-time, {d}s TTL, value hidden)", .{
+            ttl_secs,
+        }) catch "Web relay pairing code generated (value hidden)";
+    }
+
+    fn localPairingLogMessage(code: []const u8) []const u8 {
+        _ = code;
+        return "Web local pairing code active (fixed, value hidden)";
+    }
+
     fn rotateRelayPairingCodeLocked(self: *WebChannel, reason: []const u8) void {
         if (self.transport == .local) {
             if (self.relay_pairing_guard) |*guard| {
@@ -470,7 +501,7 @@ pub const WebChannel = struct {
                 };
                 self.relay_pairing_issued_at = std.time.timestamp();
                 if (!std.mem.eql(u8, reason, "consumed")) {
-                    log.info("Web local pairing code active (fixed): {s}", .{code});
+                    log.info("{s}", .{localPairingLogMessage(code)});
                 }
             }
             return;
@@ -478,12 +509,9 @@ pub const WebChannel = struct {
 
         if (self.relay_pairing_guard) |*guard| {
             if (guard.regeneratePairingCode()) |code| {
+                var pairing_log_buf: [160]u8 = undefined;
                 self.relay_pairing_issued_at = std.time.timestamp();
-                log.info("Web relay pairing code rotated ({s}, one-time, {d}s TTL): {s}", .{
-                    reason,
-                    self.relay_pairing_code_ttl_secs,
-                    code,
-                });
+                log.info("{s}", .{relayPairingLogMessage(&pairing_log_buf, self.relay_pairing_code_ttl_secs, reason, code)});
             }
         }
     }
@@ -1027,6 +1055,9 @@ pub const WebChannel = struct {
             .port = self.port,
             .address = self.listen_address,
             .max_conn = @intCast(self.max_connections),
+            .handshake = .{
+                .max_size = self.max_handshake_size,
+            },
         }) catch |err| {
             log.err("Failed to init WebSocket server: {}", .{err});
             return err;
@@ -1320,6 +1351,10 @@ pub const WebChannel = struct {
             .local => self.running.load(.acquire),
             .relay => self.running.load(.acquire) and self.relay_connected.load(.acquire),
         };
+    }
+
+    fn wsSupportsStreamingOutbound(_: *anyopaque) bool {
+        return true;
     }
 
     fn handleInboundEvent(self: *WebChannel, data: []const u8, forced_session_id: ?[]const u8) void {
@@ -1641,7 +1676,7 @@ pub const WebChannel = struct {
             } else {
                 // Pairing-first local UX: allow unauthenticated upgrade only on loopback.
                 if (pairing_mod.isPublicBind(web_channel.listen_address)) {
-                    log.warn("WS connection rejected: token required for non-loopback bind", .{});
+                    log.warn("{s}", .{publicBindTokenRequiredLogMessage(web_channel.message_auth_mode)});
                     return error.Forbidden;
                 }
                 if (web_channel.message_auth_mode == .token) {
@@ -1807,6 +1842,7 @@ test "WebChannel initFromConfig uses defaults" {
     try std.testing.expectEqualStrings("127.0.0.1", ch.listen_address);
     try std.testing.expectEqualStrings(config_types.WebConfig.DEFAULT_PATH, ch.ws_path);
     try std.testing.expectEqual(@as(u16, 10), ch.max_connections);
+    try std.testing.expectEqual(config_types.WebConfig.DEFAULT_MAX_HANDSHAKE_SIZE, ch.max_handshake_size);
     try std.testing.expectEqualStrings("default", ch.account_id);
     try std.testing.expect(ch.configured_auth_token == null);
     try std.testing.expectEqual(@as(usize, 0), ch.allowed_origins.len);
@@ -1828,6 +1864,7 @@ test "WebChannel initFromConfig uses custom values" {
         .listen = "0.0.0.0",
         .path = "/relay/",
         .max_connections = 5,
+        .max_handshake_size = 12_288,
         .account_id = "web-main",
         .auth_token = "test-token-123456",
         .message_auth_mode = "token",
@@ -1837,6 +1874,7 @@ test "WebChannel initFromConfig uses custom values" {
     try std.testing.expectEqualStrings("0.0.0.0", ch.listen_address);
     try std.testing.expectEqualStrings("/relay", ch.ws_path);
     try std.testing.expectEqual(@as(u16, 5), ch.max_connections);
+    try std.testing.expectEqual(@as(u16, 12_288), ch.max_handshake_size);
     try std.testing.expectEqualStrings("web-main", ch.account_id);
     try std.testing.expectEqualStrings("test-token-123456", ch.configured_auth_token.?);
     try std.testing.expectEqual(WebChannel.MessageAuthMode.token, ch.message_auth_mode);
@@ -1891,6 +1929,13 @@ test "WebChannel initFromConfig clamps max_connections to tracked limit" {
         .max_connections = 500,
     });
     try std.testing.expectEqual(@as(u16, 64), ch.max_connections);
+}
+
+test "WebChannel initFromConfig normalizes zero handshake size to default" {
+    const ch = WebChannel.initFromConfig(std.testing.allocator, .{
+        .max_handshake_size = 0,
+    });
+    try std.testing.expectEqual(config_types.WebConfig.DEFAULT_MAX_HANDSHAKE_SIZE, ch.max_handshake_size);
 }
 
 test "WebChannel vtable name returns web" {
@@ -2294,6 +2339,26 @@ test "WebChannel local pairing code never expires" {
 
     ch.relay_pairing_issued_at = std.time.timestamp() - 86_400;
     try std.testing.expect(!ch.relayPairingCodeExpired());
+}
+
+test "WebChannel public bind token guidance mentions loopback-only pairing" {
+    try std.testing.expect(std.mem.indexOf(u8, WebChannel.publicBindTokenRequiredLogMessage(.pairing), "loopback-only") != null);
+    try std.testing.expect(std.mem.indexOf(u8, WebChannel.publicBindTokenRequiredLogMessage(.pairing), "/ws?token=<auth_token>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, WebChannel.publicBindTokenRequiredLogMessage(.token), "Authorization header") != null);
+}
+
+test "WebChannel relay pairing log message hides code" {
+    var buf: [160]u8 = undefined;
+    const msg = WebChannel.relayPairingLogMessage(&buf, 300, "expired", "654321");
+    try std.testing.expect(std.mem.indexOf(u8, msg, "654321") == null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "expired") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "value hidden") != null);
+}
+
+test "WebChannel local pairing log message hides fixed code" {
+    const msg = WebChannel.localPairingLogMessage("123456");
+    try std.testing.expect(std.mem.indexOf(u8, msg, "123456") == null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "value hidden") != null);
 }
 
 test "WebChannel relay encrypted user_message is published to bus" {

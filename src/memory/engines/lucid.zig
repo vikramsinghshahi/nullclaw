@@ -442,6 +442,11 @@ pub const LucidMemory = struct {
         return self.localMemory().get(allocator, key);
     }
 
+    fn implGetScoped(ptr: *anyopaque, allocator: std.mem.Allocator, key: []const u8, session_id: ?[]const u8) anyerror!?MemoryEntry {
+        const self = castSelf(ptr);
+        return self.localMemory().getScoped(allocator, key, session_id);
+    }
+
     fn implList(ptr: *anyopaque, allocator: std.mem.Allocator, category: ?MemoryCategory, session_id: ?[]const u8) anyerror![]MemoryEntry {
         const self = castSelf(ptr);
         return self.localMemory().list(allocator, category, session_id);
@@ -450,6 +455,11 @@ pub const LucidMemory = struct {
     fn implForget(ptr: *anyopaque, key: []const u8) anyerror!bool {
         const self = castSelf(ptr);
         return self.localMemory().forget(key);
+    }
+
+    fn implForgetScoped(ptr: *anyopaque, key: []const u8, session_id: ?[]const u8) anyerror!bool {
+        const self = castSelf(ptr);
+        return self.localMemory().forgetScoped(self.allocator, key, session_id);
     }
 
     fn implCount(ptr: *anyopaque) anyerror!usize {
@@ -479,8 +489,10 @@ pub const LucidMemory = struct {
         .store = &implStore,
         .recall = &implRecall,
         .get = &implGet,
+        .getScoped = &implGetScoped,
         .list = &implList,
         .forget = &implForget,
+        .forgetScoped = &implForgetScoped,
         .count = &implCount,
         .healthCheck = &implHealthCheck,
         .deinit = &implDeinit,
@@ -515,11 +527,47 @@ pub const LucidMemory = struct {
         return self.local.clearAutoSaved(session_id);
     }
 
+    fn implSessionSaveUsage(ptr: *anyopaque, session_id: []const u8, total_tokens: u64) anyerror!void {
+        const self = castSelf(ptr);
+        return self.local.saveUsage(session_id, total_tokens);
+    }
+
+    fn implSessionLoadUsage(ptr: *anyopaque, session_id: []const u8) anyerror!?u64 {
+        const self = castSelf(ptr);
+        return self.local.loadUsage(session_id);
+    }
+
+    fn implSessionCountSessions(ptr: *anyopaque) anyerror!u64 {
+        const self = castSelf(ptr);
+        return self.local.countSessions();
+    }
+
+    fn implSessionListSessions(ptr: *anyopaque, allocator: std.mem.Allocator, limit: usize, offset: usize) anyerror![]root.SessionInfo {
+        const self = castSelf(ptr);
+        return self.local.listSessions(allocator, limit, offset);
+    }
+
+    fn implSessionCountDetailedMessages(ptr: *anyopaque, session_id: []const u8) anyerror!u64 {
+        const self = castSelf(ptr);
+        return self.local.countDetailedMessages(session_id);
+    }
+
+    fn implSessionLoadMessagesDetailed(ptr: *anyopaque, allocator: std.mem.Allocator, session_id: []const u8, limit: usize, offset: usize) anyerror![]root.DetailedMessageEntry {
+        const self = castSelf(ptr);
+        return self.local.loadMessagesDetailed(allocator, session_id, limit, offset);
+    }
+
     const session_vtable = root.SessionStore.VTable{
         .saveMessage = &implSessionSaveMessage,
         .loadMessages = &implSessionLoadMessages,
         .clearMessages = &implSessionClearMessages,
         .clearAutoSaved = &implSessionClearAutoSaved,
+        .saveUsage = &implSessionSaveUsage,
+        .loadUsage = &implSessionLoadUsage,
+        .countSessions = &implSessionCountSessions,
+        .listSessions = &implSessionListSessions,
+        .countDetailedMessages = &implSessionCountDetailedMessages,
+        .loadMessagesDetailed = &implSessionLoadMessagesDetailed,
     };
 
     pub fn sessionStore(self: *Self) root.SessionStore {

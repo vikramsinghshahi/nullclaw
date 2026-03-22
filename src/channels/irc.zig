@@ -2,6 +2,7 @@ const std = @import("std");
 const root = @import("root.zig");
 const config_types = @import("../config_types.zig");
 const bus_mod = @import("../bus.zig");
+const thread_stacks = @import("../thread_stacks.zig");
 
 const log = std.log.scoped(.irc);
 
@@ -119,7 +120,7 @@ pub const IrcChannel = struct {
     }
 
     pub fn isUserAllowed(self: *const IrcChannel, nick: []const u8) bool {
-        return root.isAllowed(self.allow_from, nick);
+        return root.isAllowedScoped("irc channel", self.allow_from, nick);
     }
 
     pub fn setBus(self: *IrcChannel, b: *bus_mod.Bus) void {
@@ -455,7 +456,7 @@ pub const IrcChannel = struct {
             try self.sendRaw(join_fbs.getWritten());
         }
 
-        self.reader_thread = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, readerLoop, .{self});
+        self.reader_thread = try std.Thread.spawn(.{ .stack_size = thread_stacks.CONTROL_LOOP_STACK_SIZE }, readerLoop, .{self});
     }
 
     fn vtableStop(ptr: *anyopaque) void {

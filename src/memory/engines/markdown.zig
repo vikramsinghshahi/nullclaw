@@ -7,6 +7,7 @@
 //! This backend is append-only: forget() is a no-op to preserve audit trail.
 
 const std = @import("std");
+const fs_compat = @import("../../fs_compat.zig");
 const root = @import("../root.zig");
 const Memory = root.Memory;
 const MemoryCategory = root.MemoryCategory;
@@ -75,7 +76,7 @@ pub const MarkdownMemory = struct {
         const file = try std.fs.cwd().createFile(path, .{ .truncate = false, .read = true });
         defer file.close();
 
-        const stat = try file.stat();
+        const stat = try fs_compat.stat(file);
         const size = stat.size;
 
         try file.seekTo(size);
@@ -173,7 +174,7 @@ pub const MarkdownMemory = struct {
             const root_path = try self.rootPath(allocator, candidate.filename);
             defer allocator.free(root_path);
 
-            const content = std.fs.cwd().readFileAlloc(allocator, root_path, 1024 * 1024) catch continue;
+            const content = fs_compat.readFileAlloc(std.fs.cwd(), allocator, root_path, 1024 * 1024) catch continue;
             defer allocator.free(content);
 
             const canonical = std.fs.realpathAlloc(allocator, root_path) catch
@@ -200,7 +201,7 @@ pub const MarkdownMemory = struct {
                 if (!std.mem.endsWith(u8, entry.name, ".md")) continue;
                 const fpath = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ md, entry.name });
                 defer allocator.free(fpath);
-                if (std.fs.cwd().readFileAlloc(allocator, fpath, 1024 * 1024)) |content| {
+                if (fs_compat.readFileAlloc(std.fs.cwd(), allocator, fpath, 1024 * 1024)) |content| {
                     defer allocator.free(content);
                     const fname = entry.name[0 .. entry.name.len - 3];
                     const entries = try parseEntries(content, fname, .daily, allocator);
@@ -327,6 +328,10 @@ pub const MarkdownMemory = struct {
         return found;
     }
 
+    fn implGetScoped(ptr: *anyopaque, allocator: std.mem.Allocator, key: []const u8, _: ?[]const u8) anyerror!?MemoryEntry {
+        return implGet(ptr, allocator, key);
+    }
+
     fn implList(ptr: *anyopaque, allocator: std.mem.Allocator, category: ?MemoryCategory, _: ?[]const u8) anyerror![]MemoryEntry {
         const self_: *Self = @ptrCast(@alignCast(ptr));
 
@@ -361,6 +366,10 @@ pub const MarkdownMemory = struct {
         return false;
     }
 
+    fn implForgetScoped(_: *anyopaque, _: []const u8, _: ?[]const u8) anyerror!bool {
+        return false;
+    }
+
     fn implCount(ptr: *anyopaque) anyerror!usize {
         const self_: *Self = @ptrCast(@alignCast(ptr));
         const all = try self_.readAllEntries(self_.allocator);
@@ -390,8 +399,10 @@ pub const MarkdownMemory = struct {
         .store = &implStore,
         .recall = &implRecall,
         .get = &implGet,
+        .getScoped = &implGetScoped,
         .list = &implList,
         .forget = &implForget,
+        .forgetScoped = &implForgetScoped,
         .count = &implCount,
         .healthCheck = &implHealthCheck,
         .deinit = &implDeinit,
@@ -516,6 +527,23 @@ test "markdown accepts session_id param" {
         for (listed) |*e| e.deinit(std.testing.allocator);
         std.testing.allocator.free(listed);
     }
+}
+
+test "markdown getScoped returns entry inside isolated workspace" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+
+    var mem = try MarkdownMemory.init(std.testing.allocator, base);
+    defer mem.deinit();
+    const m = mem.memory();
+
+    try m.store("scoped_key", "session data", .core, "session-123");
+
+    const entry = (try m.getScoped(std.testing.allocator, "scoped_key", "session-123")).?;
+    defer entry.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, entry.content, "session data") != null);
 }
 
 test "markdown reads memory.md when MEMORY.md is absent" {

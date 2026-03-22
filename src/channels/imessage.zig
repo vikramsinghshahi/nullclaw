@@ -5,6 +5,7 @@ const root = @import("root.zig");
 const bus_mod = @import("../bus.zig");
 const config_types = @import("../config_types.zig");
 const platform = @import("../platform.zig");
+const thread_stacks = @import("../thread_stacks.zig");
 
 const log = std.log.scoped(.imessage);
 
@@ -72,7 +73,7 @@ pub const IMessageChannel = struct {
     }
 
     pub fn isContactAllowed(self: *const IMessageChannel, sender: []const u8) bool {
-        return root.isAllowed(self.allow_from, sender);
+        return root.isAllowedScoped("imessage channel", self.allow_from, sender);
     }
 
     fn senderAllowedForContext(self: *const IMessageChannel, sender: []const u8, is_group: bool) bool {
@@ -82,7 +83,7 @@ pub const IMessageChannel = struct {
         if (std.mem.eql(u8, self.group_policy, "open")) return true;
 
         const effective = if (self.group_allow_from.len > 0) self.group_allow_from else self.allow_from;
-        return root.isAllowed(effective, sender);
+        return root.isAllowedScoped("imessage channel", effective, sender);
     }
 
     fn currentChatDbPath(self: *const IMessageChannel, allocator: std.mem.Allocator) ![]u8 {
@@ -410,7 +411,7 @@ pub const IMessageChannel = struct {
         if (builtin.is_test) return;
         if (builtin.os.tag != .macos) return;
 
-        self.poll_thread = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, pollLoop, .{self});
+        self.poll_thread = try std.Thread.spawn(.{ .stack_size = thread_stacks.CONTROL_LOOP_STACK_SIZE }, pollLoop, .{self});
     }
 
     fn vtableStop(ptr: *anyopaque) void {
