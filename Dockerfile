@@ -12,10 +12,7 @@ COPY src/ src/
 COPY vendor/sqlite3/ vendor/sqlite3/
 
 ARG TARGETARCH
-ARG VERSION=dev
-RUN --mount=type=cache,target=/root/.cache/zig \
-    --mount=type=cache,target=/app/.zig-cache \
-    set -eu; \
+RUN set -eu; \
     arch="${TARGETARCH:-}"; \
     if [ -z "${arch}" ]; then \
       case "$(uname -m)" in \
@@ -29,27 +26,65 @@ RUN --mount=type=cache,target=/root/.cache/zig \
       arm64) zig_target="aarch64-linux-musl" ;; \
       *) echo "Unsupported TARGETARCH: ${arch}" >&2; exit 1 ;; \
     esac; \
-    zig build -Dtarget="${zig_target}" -Doptimize=ReleaseSmall -Dversion="${VERSION}"
+    zig build -Dtarget="${zig_target}" -Doptimize=ReleaseSmall
 
 # ── Stage 2: Config Prep ─────────────────────────────────────
+# This stage bakes a minimal, non-secret default config into the image.
+# You can later override it by building your own image with a different config
+# or by mounting a volume at /nullclaw-data/.nullclaw.
+# Primary model set to deepseek-chat (cheaper); use /model in Telegram to switch if needed.
 FROM busybox:1.37 AS config
 
-# Keep config.json at the volume root so existing compose volumes remain readable.
-RUN mkdir -p /nullclaw-data/workspace
+RUN mkdir -p /nullclaw-data/.nullclaw /nullclaw-data/workspace
 
-RUN cat > /nullclaw-data/config.json << 'EOF'
+# Copy workspace templates into the image so the agent can read them at runtime
+COPY src/workspace_templates/USER.md /nullclaw-data/workspace/USER.md
+COPY src/workspace_templates/IDENTITY.md /nullclaw-data/workspace/IDENTITY.md
+COPY src/workspace_templates/TOOLS.md /nullclaw-data/workspace/TOOLS.md
+COPY src/workspace_templates/SOUL.md /nullclaw-data/workspace/SOUL.md
+COPY src/workspace_templates/AGENTS.md /nullclaw-data/workspace/AGENTS.md
+
+RUN cat > /nullclaw-data/.nullclaw/config.json << 'EOF'
 {
-  "agents": {
-    "defaults": {
-      "model": {
-        "primary": "openrouter/anthropic/claude-sonnet-4"
-      }
-    }
-  },
+  "default_temperature": 0.7,
   "models": {
     "providers": {
       "openrouter": {}
     }
+  },
+  "agents": {
+    "defaults": {
+      "model": {
+        "primary": "openrouter/deepseek/deepseek-chat",
+        "fallback": "openrouter/openai/gpt-4o-mini"
+      },
+      "system_prompt": "You are a capable coding assistant with full git access. You can use the git_operations tool for: status, diff, log, branch, commit, add, checkout, stash, and push. For git init, remote add, or clone, use the shell tool. The workspace directory is /nullclaw-data/workspace. When asked to push code, first ensure credentials are configured (use git_operations with operation 'configure_credentials' or check GITHUB_TOKEN env var), then use git_operations with operation 'push'."
+    }
+  },
+  "agent": {
+    "max_tool_iterations": 5
+  },
+  "channels": {
+    "cli": true,
+    "telegram": {
+      "accounts": {
+        "main": {
+          "bot_token": "8661978832:AAF4eyspgR3GVIX2iA1P2JvNl_7X7ssvwYk",
+          "allow_from": ["yana_akam"],
+          "reply_in_private": true
+        }
+      }
+    }
+  },
+  "memory": {
+    "backend": "markdown",
+    "auto_save": true
+  },
+  "autonomy": {
+    "level": "full",
+    "workspace_only": true,
+    "allowed_commands": ["git", "git *", "ls", "cat", "echo", "pwd", "mkdir", "mv", "cp", "bash", "sh", "touch", "rm", "trash", "find", "grep", "head", "tail", "wc"],
+    "allowed_paths": ["/nullclaw-data/workspace"]
   },
   "gateway": {
     "port": 3000,
@@ -68,19 +103,25 @@ FROM alpine:3.23 AS release-base
 
 LABEL org.opencontainers.image.source=https://github.com/nullclaw/nullclaw
 
-RUN apk add --no-cache ca-certificates curl tzdata
+RUN apk add --no-cache ca-certificates curl tzdata git openssh-client
 
 COPY --from=builder /app/zig-out/bin/nullclaw /usr/local/bin/nullclaw
 COPY --from=config /nullclaw-data /nullclaw-data
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+
+# Git identity for bot commits (git config is blocked by security policy; set here so commits work)
+RUN printf '[user]\nname = nullclaw-bot\nemail = bot@nullclaw.local\n' > /nullclaw-data/.gitconfig && chown 65534:65534 /nullclaw-data/.gitconfig
+# .ssh dir for entrypoint (deploy key); create as root then chown so runtime user 65534 can write key/config
+RUN mkdir -p /nullclaw-data/.ssh && chown 65534:65534 /nullclaw-data/.ssh
 
 ENV NULLCLAW_WORKSPACE=/nullclaw-data/workspace
-ENV NULLCLAW_HOME=/nullclaw-data
 ENV HOME=/nullclaw-data
 ENV NULLCLAW_GATEWAY_PORT=3000
 
 WORKDIR /nullclaw-data
 EXPOSE 3000
-ENTRYPOINT ["nullclaw"]
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["gateway", "--port", "3000", "--host", "::"]
 
 # Optional autonomous mode (explicit opt-in):
