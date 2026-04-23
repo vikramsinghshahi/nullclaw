@@ -1,4 +1,5 @@
 const std = @import("std");
+const std_compat = @import("compat");
 const builtin = @import("builtin");
 const providers = @import("../providers/root.zig");
 const Tool = @import("../tools/root.zig").Tool;
@@ -8,14 +9,19 @@ const subagent_mod = @import("../subagent.zig");
 const memory_mod = @import("../memory/root.zig");
 const config_types = @import("../config_types.zig");
 const config_module = @import("../config.zig");
+const config_paths = @import("../config_paths.zig");
 const capabilities_mod = @import("../capabilities.zig");
 const config_mutator = @import("../config_mutator.zig");
+const interaction_choices = @import("../interactions/choices.zig");
+const onboard = @import("../onboard.zig");
 const context_tokens = @import("context_tokens.zig");
 const max_tokens_resolver = @import("max_tokens.zig");
 const control_plane = @import("../control_plane.zig");
+const model_refs = @import("../model_refs.zig");
 const provider_names = @import("../provider_names.zig");
 const version = @import("../version.zig");
 const command_summary = @import("../command_summary.zig");
+const util = @import("../util.zig");
 const log = std.log.scoped(.agent);
 
 const SlashCommand = control_plane.SlashCommand;
@@ -24,6 +30,8 @@ const isSlashName = control_plane.isSlashName;
 
 pub const BARE_SESSION_RESET_PROMPT =
     "A new session was started via /new or /reset. Execute your Session Startup sequence now - read the required files before responding to the user. Then greet the user in your configured persona, if one is provided. Be yourself - use your defined voice, mannerisms, and mood. Keep it to 1-3 sentences and ask what they want to do. If the runtime model differs from default_model in the system prompt, mention the default model. Do not mention internal steps, files, tools, or reasoning.";
+
+const MODEL_MENU_PAGE_SIZE: usize = 10;
 
 pub fn bareSessionResetPrompt(message: []const u8) ?[]const u8 {
     const cmd = parseSlashCommand(message) orelse return null;
@@ -122,7 +130,7 @@ fn classifySlashCommand(cmd: SlashCommand) SlashCommandKind {
     if (isSlashName(cmd, "elevated") or isSlashName(cmd, "elev")) return .elevated;
     if (isSlashName(cmd, "bash")) return .bash;
     if (isSlashName(cmd, "poll")) return .poll;
-    if (isSlashName(cmd, "skill")) return .skill;
+    if (isSlashName(cmd, "skill") or isSlashName(cmd, "skills") or isSlashName(cmd, "iskill")) return .skill;
     if (isSlashName(cmd, "doctor")) return .doctor;
     if (isSlashName(cmd, "memory")) return .memory;
     return .unknown;
@@ -175,6 +183,7 @@ pub fn persistedRuntimeCommand(message: []const u8) ?[]const u8 {
             if (arg.len == 0 or std.ascii.eqlIgnoreCase(arg, "status")) break :blk null;
             break :blk message;
         },
+        .skill => skillRuntimeCommand(message, cmd),
         .session => blk: {
             if (!std.ascii.eqlIgnoreCase(first, "ttl")) break :blk null;
             const tail = splitFirstToken(arg).tail;
@@ -190,6 +199,35 @@ pub fn persistedRuntimeCommand(message: []const u8) ?[]const u8 {
     };
 }
 
+fn skillRuntimeCommand(message: []const u8, cmd: SlashCommand) ?[]const u8 {
+    if (isSlashName(cmd, "skills")) return null;
+
+    const parsed = splitFirstToken(cmd.arg);
+    const head = parsed.head;
+    const tail = std.mem.trim(u8, parsed.tail, " \t");
+    if (head.len == 0) return null;
+
+    if (std.ascii.eqlIgnoreCase(head, "status") or
+        std.ascii.eqlIgnoreCase(head, "list") or
+        std.ascii.eqlIgnoreCase(head, "reload") or
+        std.ascii.eqlIgnoreCase(head, "refresh"))
+    {
+        return null;
+    }
+
+    if (std.ascii.eqlIgnoreCase(head, "clear") or std.ascii.eqlIgnoreCase(head, "off")) {
+        return message;
+    }
+
+    if (isSlashName(cmd, "iskill")) {
+        if (tail.len != 0) return null;
+        return message;
+    }
+
+    if (tail.len == 0) return message;
+    return null;
+}
+
 fn firstToken(arg: []const u8) []const u8 {
     var it = std.mem.tokenizeAny(u8, arg, " \t");
     return it.next() orelse "";
@@ -201,6 +239,355 @@ fn parsePositiveUsize(raw: []const u8) ?usize {
     return n;
 }
 
+fn interactiveModelMenuChannel(session_id: ?[]const u8, context_channel: ?[]const u8) ?[]const u8 {
+    if (context_channel) |channel| {
+        if (provider_names.providerNamesMatchIgnoreCase(channel, "telegram")) return "telegram";
+        if (provider_names.providerNamesMatchIgnoreCase(channel, "discord")) return "discord";
+        if (provider_names.providerNamesMatchIgnoreCase(channel, "slack")) return "slack";
+        if (provider_names.providerNamesMatchIgnoreCase(channel, "lark")) return "lark";
+    }
+    const sid = session_id orelse return null;
+
+    if (std.mem.startsWith(u8, sid, "agent:")) {
+        const after_agent = sid["agent:".len..];
+        const agent_sep = std.mem.indexOfScalar(u8, after_agent, ':') orelse return null;
+        const routed = after_agent[agent_sep + 1 ..];
+        if (std.mem.startsWith(u8, routed, "telegram:")) return "telegram";
+        if (std.mem.startsWith(u8, routed, "discord:")) return "discord";
+        if (std.mem.startsWith(u8, routed, "slack:")) return "slack";
+        if (std.mem.startsWith(u8, routed, "lark:")) return "lark";
+    }
+
+    if (std.mem.startsWith(u8, sid, "telegram:")) return "telegram";
+    if (std.mem.startsWith(u8, sid, "discord:")) return "discord";
+    if (std.mem.startsWith(u8, sid, "slack:")) return "slack";
+    if (std.mem.startsWith(u8, sid, "lark:")) return "lark";
+    return null;
+}
+
+fn modelMenuChoiceLabel(allocator: std.mem.Allocator, model_id: []const u8, is_current: bool) ![]u8 {
+    const prefix = if (is_current) "* " else "";
+    const max_model_len = interaction_choices.MAX_LABEL_LEN - prefix.len;
+    const visible_model = if (model_id.len <= max_model_len) model_id else model_id[0..max_model_len];
+    return std.fmt.allocPrint(allocator, "{s}{s}", .{ prefix, visible_model });
+}
+
+fn freeOwnedStringSlice(allocator: std.mem.Allocator, items: [][]const u8) void {
+    for (items) |item| allocator.free(item);
+    allocator.free(items);
+}
+
+fn providerMenuChoiceLabel(allocator: std.mem.Allocator, provider_name: []const u8, is_current: bool) ![]u8 {
+    const prefix = if (is_current) "* " else "";
+    const max_provider_len = interaction_choices.MAX_LABEL_LEN - prefix.len;
+    const visible_provider = if (provider_name.len <= max_provider_len) provider_name else provider_name[0..max_provider_len];
+    return std.fmt.allocPrint(allocator, "{s}{s}", .{ prefix, visible_provider });
+}
+
+fn appendUniqueOwnedString(
+    allocator: std.mem.Allocator,
+    items: *std.ArrayListUnmanaged([]const u8),
+    value: []const u8,
+) !void {
+    for (items.items) |existing| {
+        if (provider_names.providerNamesMatchIgnoreCase(existing, value)) return;
+    }
+    try items.append(allocator, try allocator.dupe(u8, value));
+}
+
+fn collectInteractiveProviderNames(self: anytype, allocator: std.mem.Allocator) ![][]const u8 {
+    var items: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer freeOwnedStringSlice(allocator, items.items);
+
+    if (@hasField(@TypeOf(self.*), "default_provider") and self.default_provider.len > 0) {
+        try appendUniqueOwnedString(allocator, &items, self.default_provider);
+    }
+    if (@hasField(@TypeOf(self.*), "configured_providers")) {
+        for (self.configured_providers) |entry| {
+            if (entry.name.len == 0) continue;
+            try appendUniqueOwnedString(allocator, &items, entry.name);
+        }
+    }
+    return try items.toOwnedSlice(allocator);
+}
+
+fn renderInteractiveProviderMenuFromProviders(
+    allocator: std.mem.Allocator,
+    current_provider: []const u8,
+    current_model: []const u8,
+    page_number: usize,
+    providers_list: []const []const u8,
+) !?[]u8 {
+    if (providers_list.len == 0) return null;
+
+    const total_pages = @max(@as(usize, 1), std.math.divCeil(usize, providers_list.len, MODEL_MENU_PAGE_SIZE) catch 1);
+    const clamped_page = @min(@max(page_number, 1), total_pages);
+    const start = (clamped_page - 1) * MODEL_MENU_PAGE_SIZE;
+    const end = @min(start + MODEL_MENU_PAGE_SIZE, providers_list.len);
+
+    const ChoiceDraft = struct {
+        id: []const u8,
+        label: []const u8,
+        submit_text: []const u8,
+    };
+
+    var options: [interaction_choices.MAX_OPTIONS]ChoiceDraft = undefined;
+    var option_id_bufs: [interaction_choices.MAX_OPTIONS][interaction_choices.MAX_ID_LEN]u8 = undefined;
+    var submit_text_bufs: [interaction_choices.MAX_OPTIONS][interaction_choices.MAX_SUBMIT_TEXT_LEN]u8 = undefined;
+    var option_count: usize = 0;
+    var labels_to_free: [interaction_choices.MAX_OPTIONS]?[]u8 = .{null} ** interaction_choices.MAX_OPTIONS;
+    defer {
+        for (labels_to_free) |label_opt| {
+            if (label_opt) |label| allocator.free(label);
+        }
+    }
+
+    for (providers_list[start..end], 0..) |provider_name, idx| {
+        const label = try providerMenuChoiceLabel(allocator, provider_name, provider_names.providerNamesMatchIgnoreCase(provider_name, current_provider));
+        labels_to_free[option_count] = label;
+        const submit_text = try std.fmt.bufPrint(&submit_text_bufs[option_count], "/model provider {s}", .{provider_name});
+        const option_id = try std.fmt.bufPrint(&option_id_bufs[option_count], "p{d}", .{idx + 1});
+        options[option_count] = .{
+            .id = option_id,
+            .label = label,
+            .submit_text = submit_text,
+        };
+        option_count += 1;
+    }
+
+    if (clamped_page > 1 and option_count < interaction_choices.MAX_OPTIONS) {
+        const submit_text = try std.fmt.bufPrint(&submit_text_bufs[option_count], "/model page {d}", .{clamped_page - 1});
+        options[option_count] = .{ .id = "prev", .label = "Prev", .submit_text = submit_text };
+        option_count += 1;
+    }
+    if (clamped_page < total_pages and option_count < interaction_choices.MAX_OPTIONS) {
+        const submit_text = try std.fmt.bufPrint(&submit_text_bufs[option_count], "/model page {d}", .{clamped_page + 1});
+        options[option_count] = .{ .id = "next", .label = "Next", .submit_text = submit_text };
+        option_count += 1;
+    }
+
+    if (option_count < interaction_choices.MIN_OPTIONS) return null;
+
+    const visible = try std.fmt.allocPrint(
+        allocator,
+        "Current model: {s}\nProvider: {s}\nChoose a provider (page {d}/{d}).",
+        .{ current_model, current_provider, clamped_page, total_pages },
+    );
+    defer allocator.free(visible);
+
+    return try interaction_choices.renderAssistantChoices(allocator, visible, options[0..option_count]);
+}
+fn renderInteractiveModelMenuFromModels(
+    allocator: std.mem.Allocator,
+    provider: []const u8,
+    current_model: []const u8,
+    page_number: usize,
+    models: []const []const u8,
+) !?[]u8 {
+    if (models.len == 0) return null;
+
+    const total_pages = @max(@as(usize, 1), std.math.divCeil(usize, models.len, MODEL_MENU_PAGE_SIZE) catch 1);
+    const clamped_page = @min(@max(page_number, 1), total_pages);
+    const start = (clamped_page - 1) * MODEL_MENU_PAGE_SIZE;
+    const end = @min(start + MODEL_MENU_PAGE_SIZE, models.len);
+
+    const ChoiceDraft = struct {
+        id: []const u8,
+        label: []const u8,
+        submit_text: []const u8,
+    };
+
+    var options: [interaction_choices.MAX_OPTIONS]ChoiceDraft = undefined;
+    var option_id_bufs: [interaction_choices.MAX_OPTIONS][interaction_choices.MAX_ID_LEN]u8 = undefined;
+    var submit_text_bufs: [interaction_choices.MAX_OPTIONS][interaction_choices.MAX_SUBMIT_TEXT_LEN]u8 = undefined;
+    var option_count: usize = 0;
+    var labels_to_free: [interaction_choices.MAX_OPTIONS]?[]u8 = .{null} ** interaction_choices.MAX_OPTIONS;
+    defer {
+        for (labels_to_free) |label_opt| {
+            if (label_opt) |label| allocator.free(label);
+        }
+    }
+
+    for (models[start..end], 0..) |model_id, idx| {
+        const label = try modelMenuChoiceLabel(allocator, model_id, std.mem.eql(u8, model_id, current_model));
+        labels_to_free[option_count] = label;
+        const submit_text = try std.fmt.bufPrint(&submit_text_bufs[option_count], "/model {s}", .{model_id});
+        const option_id = try std.fmt.bufPrint(&option_id_bufs[option_count], "m{d}", .{idx + 1});
+
+        options[option_count] = .{
+            .id = option_id,
+            .label = label,
+            .submit_text = submit_text,
+        };
+        option_count += 1;
+    }
+
+    if (clamped_page > 1) {
+        const submit_text = try std.fmt.bufPrint(&submit_text_bufs[option_count], "/model provider {s} page {d}", .{ provider, clamped_page - 1 });
+        options[option_count] = .{
+            .id = "prev",
+            .label = "Prev",
+            .submit_text = submit_text,
+        };
+        option_count += 1;
+    }
+    if (clamped_page < total_pages) {
+        const submit_text = try std.fmt.bufPrint(&submit_text_bufs[option_count], "/model provider {s} page {d}", .{ provider, clamped_page + 1 });
+        options[option_count] = .{
+            .id = "next",
+            .label = "Next",
+            .submit_text = submit_text,
+        };
+        option_count += 1;
+    }
+
+    if (option_count < interaction_choices.MIN_OPTIONS) return null;
+
+    const visible = try std.fmt.allocPrint(
+        allocator,
+        "Current model: {s}\nProvider: {s}\nChoose a model (page {d}/{d}).",
+        .{ current_model, provider, clamped_page, total_pages },
+    );
+    defer allocator.free(visible);
+
+    return try interaction_choices.renderAssistantChoices(allocator, visible, options[0..option_count]);
+}
+
+fn renderInteractiveProviderMenu(self: anytype, page_number: usize) !?[]u8 {
+    const context_channel = if (@hasField(@TypeOf(self.*), "conversation_context"))
+        if (self.conversation_context) |ctx| ctx.channel else null
+    else
+        null;
+    if (interactiveModelMenuChannel(if (@hasField(@TypeOf(self.*), "memory_session_id")) self.memory_session_id else null, context_channel) == null) {
+        return null;
+    }
+    if (!@hasField(@TypeOf(self.*), "default_provider")) return null;
+    if (!@hasField(@TypeOf(self.*), "model_name")) return null;
+
+    const providers_list = try collectInteractiveProviderNames(self, self.allocator);
+    defer freeOwnedStringSlice(self.allocator, providers_list);
+
+    if (providers_list.len == 1) {
+        return renderInteractiveModelMenu(self, providers_list[0], page_number);
+    }
+
+    return renderInteractiveProviderMenuFromProviders(
+        self.allocator,
+        self.default_provider,
+        self.model_name,
+        page_number,
+        providers_list,
+    );
+}
+
+fn renderInteractiveModelMenu(self: anytype, provider_name: []const u8, page_number: usize) !?[]u8 {
+    const context_channel = if (@hasField(@TypeOf(self.*), "conversation_context"))
+        if (self.conversation_context) |ctx| ctx.channel else null
+    else
+        null;
+    if (interactiveModelMenuChannel(if (@hasField(@TypeOf(self.*), "memory_session_id")) self.memory_session_id else null, context_channel) == null) {
+        return null;
+    }
+    if (!@hasField(@TypeOf(self.*), "default_provider")) return null;
+    if (!@hasField(@TypeOf(self.*), "model_name")) return null;
+
+    var cfg_opt: ?config_module.Config = if (builtin.is_test) null else config_module.Config.load(self.allocator) catch null;
+    defer if (cfg_opt) |*cfg| cfg.deinit();
+
+    const api_key = if (cfg_opt) |*cfg| cfg.getProviderKey(provider_name) else null;
+    const models = onboard.fetchModels(self.allocator, provider_name, api_key) catch return null;
+    defer freeOwnedStringSlice(self.allocator, models);
+
+    return renderInteractiveModelMenuFromModels(
+        self.allocator,
+        provider_name,
+        self.model_name,
+        page_number,
+        models,
+    );
+}
+
+test "interactiveModelMenuChannel enables supported interactive channels" {
+    try std.testing.expectEqualStrings("telegram", interactiveModelMenuChannel("telegram:chat-1", null).?);
+    try std.testing.expectEqualStrings("telegram", interactiveModelMenuChannel("telegram:main:chat-1", null).?);
+    try std.testing.expectEqualStrings("discord", interactiveModelMenuChannel("discord:dm-1", null).?);
+    try std.testing.expectEqualStrings("slack", interactiveModelMenuChannel("slack:main:C123", null).?);
+    try std.testing.expectEqualStrings("lark", interactiveModelMenuChannel("lark:main:oc_123", null).?);
+    try std.testing.expectEqualStrings("telegram", interactiveModelMenuChannel("agent:main:telegram:group:42", null).?);
+    try std.testing.expectEqualStrings("discord", interactiveModelMenuChannel("agent:main:discord:direct:42", null).?);
+    try std.testing.expectEqualStrings("telegram", interactiveModelMenuChannel("agent:tg-ops:main", "telegram").?);
+    try std.testing.expectEqualStrings("discord", interactiveModelMenuChannel("agent:discord-ops:main", "discord").?);
+    try std.testing.expectEqualStrings("slack", interactiveModelMenuChannel("agent:slack-ops:main", "slack").?);
+    try std.testing.expectEqualStrings("lark", interactiveModelMenuChannel("agent:lark-ops:main", "lark").?);
+    try std.testing.expect(interactiveModelMenuChannel("cli", null) == null);
+    try std.testing.expect(interactiveModelMenuChannel(null, null) == null);
+}
+
+test "renderInteractiveModelMenuFromModels builds first page with next button" {
+    const allocator = std.testing.allocator;
+    const models = [_][]const u8{
+        "alpha",
+        "beta",
+        "gamma",
+        "theta",
+        "zeta",
+        "eta",
+        "iota",
+        "kappa",
+        "lambda",
+        "mu",
+        "nu",
+    };
+
+    const rendered = (try renderInteractiveModelMenuFromModels(allocator, "anthropic", "beta", 1, &models)).?;
+    defer allocator.free(rendered);
+
+    try std.testing.expect(std.mem.indexOf(u8, rendered, interaction_choices.START_TAG) != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "page 1/2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"label\":\"* beta\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"submit_text\":\"/model provider anthropic page 2\"") != null);
+}
+
+test "renderInteractiveModelMenuFromModels builds later page with prev button" {
+    const allocator = std.testing.allocator;
+    const models = [_][]const u8{
+        "alpha",
+        "beta",
+        "gamma",
+        "theta",
+        "zeta",
+        "eta",
+        "iota",
+        "kappa",
+        "lambda",
+        "mu",
+        "nu",
+    };
+
+    const rendered = (try renderInteractiveModelMenuFromModels(allocator, "anthropic", "nu", 2, &models)).?;
+    defer allocator.free(rendered);
+
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "page 2/2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"submit_text\":\"/model provider anthropic page 1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"submit_text\":\"/model nu\"") != null);
+}
+
+test "renderInteractiveProviderMenuFromProviders builds provider page with next button" {
+    const allocator = std.testing.allocator;
+    const providers_list = [_][]const u8{
+        "anthropic", "openai",   "openrouter", "moonshot-intl", "groq",
+        "mistral",   "deepseek", "vertex",     "gemini",        "ollama",
+        "qwen",
+    };
+
+    const rendered = (try renderInteractiveProviderMenuFromProviders(allocator, "openrouter", "claude-sonnet-4-6", 1, &providers_list)).?;
+    defer allocator.free(rendered);
+
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "Choose a provider (page 1/2)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"label\":\"* openrouter\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"submit_text\":\"/model provider anthropic\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"submit_text\":\"/model page 2\"") != null);
+}
 fn isInternalMemoryEntryKeyOrContent(key: []const u8, content: []const u8) bool {
     return memory_mod.isInternalMemoryEntryKeyOrContent(key, content);
 }
@@ -286,11 +673,75 @@ fn isConfiguredProviderName(self: anytype, provider_name: []const u8) bool {
     return false;
 }
 
-fn hasExplicitProviderPrefix(self: anytype, model: []const u8) bool {
-    const slash = std.mem.indexOfScalar(u8, model, '/') orelse return false;
-    if (slash == 0 or slash + 1 >= model.len) return false;
+const PrimaryModelSelectionRef = struct {
+    provider: []const u8,
+    model: []const u8,
+};
 
-    const provider_candidate = model[0..slash];
+fn updateExplicitProviderMatch(
+    model_ref: []const u8,
+    provider_name: []const u8,
+    best_provider: *?[]const u8,
+    best_model: *[]const u8,
+    best_provider_len: *usize,
+) void {
+    const split = model_refs.matchExplicitProviderPrefix(model_ref, provider_name) orelse return;
+    const provider = split.provider orelse return;
+    if (provider.len <= best_provider_len.*) return;
+
+    best_provider.* = provider;
+    best_model.* = split.model;
+    best_provider_len.* = provider.len;
+}
+
+fn splitExplicitProviderModelForSelf(self: anytype, model_ref: []const u8) ?PrimaryModelSelectionRef {
+    var best_provider: ?[]const u8 = null;
+    var best_model: []const u8 = undefined;
+    var best_provider_len: usize = 0;
+
+    if (@hasField(@TypeOf(self.*), "configured_providers")) {
+        for (self.configured_providers) |entry| {
+            updateExplicitProviderMatch(model_ref, entry.name, &best_provider, &best_model, &best_provider_len);
+        }
+    }
+
+    if (@hasField(@TypeOf(self.*), "model_routes")) {
+        for (self.model_routes) |route| {
+            updateExplicitProviderMatch(model_ref, route.provider, &best_provider, &best_model, &best_provider_len);
+        }
+    }
+
+    if (@hasField(@TypeOf(self.*), "fallback_providers")) {
+        for (self.fallback_providers) |provider_name| {
+            updateExplicitProviderMatch(model_ref, provider_name, &best_provider, &best_model, &best_provider_len);
+        }
+    }
+
+    if (best_provider) |provider| {
+        return .{
+            .provider = provider,
+            .model = best_model,
+        };
+    }
+    return null;
+}
+
+fn splitPrimaryModelRefForSelf(self: anytype, primary: []const u8) ?PrimaryModelSelectionRef {
+    if (splitExplicitProviderModelForSelf(self, primary)) |split| return split;
+    if (config_module.splitPrimaryModelRef(primary)) |split| {
+        return .{
+            .provider = split.provider,
+            .model = split.model,
+        };
+    }
+    return null;
+}
+
+fn hasExplicitProviderPrefix(self: anytype, model: []const u8) bool {
+    if (splitExplicitProviderModelForSelf(self, model) != null) return true;
+
+    const split = model_refs.splitProviderModel(model) orelse return false;
+    const provider_candidate = split.provider orelse return false;
     if (providers.classifyProvider(provider_candidate) != .unknown) return true;
 
     var lower_buf: [128]u8 = undefined;
@@ -317,17 +768,54 @@ fn configPrimaryModelForSelection(self: anytype, model: []const u8) ![]u8 {
     return try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ provider, trimmed });
 }
 
+fn primaryModelProviderObjectJson(
+    allocator: std.mem.Allocator,
+    provider: []const u8,
+    model: []const u8,
+) ![]u8 {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    var model_obj: std.json.ObjectMap = .empty;
+    try model_obj.put(arena.allocator(), "provider", .{ .string = provider });
+    try model_obj.put(arena.allocator(), "primary", .{ .string = model });
+    return try std.json.Stringify.valueAlloc(allocator, std.json.Value{ .object = model_obj }, .{});
+}
+
+fn configPrimaryModelMutationValue(self: anytype, model: []const u8) ![]u8 {
+    const trimmed = std.mem.trim(u8, model, " \t\r\n");
+    if (trimmed.len == 0) return error.InvalidPath;
+
+    if (hasExplicitProviderPrefix(self, trimmed)) {
+        if (splitPrimaryModelRefForSelf(self, trimmed)) |split| {
+            if (config_module.shouldSerializeDefaultModelProviderField(split.provider)) {
+                return try primaryModelProviderObjectJson(self.allocator, split.provider, split.model);
+            }
+        }
+        return try self.allocator.dupe(u8, trimmed);
+    }
+
+    const provider = if (@hasField(@TypeOf(self.*), "default_provider") and self.default_provider.len > 0)
+        self.default_provider
+    else
+        "openrouter";
+    if (config_module.shouldSerializeDefaultModelProviderField(provider)) {
+        return try primaryModelProviderObjectJson(self.allocator, provider, trimmed);
+    }
+    return try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ provider, trimmed });
+}
+
 fn persistSelectedModelToConfig(self: anytype, model: []const u8) !void {
     if (builtin.is_test) return;
 
-    const primary = try configPrimaryModelForSelection(self, model);
-    defer self.allocator.free(primary);
+    const value_raw = try configPrimaryModelMutationValue(self, model);
+    defer self.allocator.free(value_raw);
 
     var result = try config_mutator.mutateDefaultConfig(
         self.allocator,
         .set,
         "agents.defaults.model.primary",
-        primary,
+        value_raw,
         .{ .apply = true },
     );
     defer config_mutator.freeMutationResult(self.allocator, &result);
@@ -423,6 +911,81 @@ test "configPrimaryModelForSelection keeps explicit configured custom provider p
     try std.testing.expectEqualStrings("customgw/model-a", primary);
 }
 
+test "configPrimaryModelForSelection keeps explicit custom url provider ref" {
+    const allocator = std.testing.allocator;
+    var dummy = struct {
+        allocator: std.mem.Allocator,
+        default_provider: []const u8,
+        configured_providers: []const config_types.ProviderEntry,
+    }{
+        .allocator = allocator,
+        .default_provider = "openrouter",
+        .configured_providers = &.{},
+    };
+
+    const primary = try configPrimaryModelForSelection(&dummy, "custom:https://gateway.example.com/proxy/v1/openai/v2/qianfan/custom-model");
+    defer allocator.free(primary);
+    try std.testing.expectEqualStrings("custom:https://gateway.example.com/proxy/v1/openai/v2/qianfan/custom-model", primary);
+}
+
+test "configPrimaryModelForSelection keeps versionless custom url provider ref" {
+    const allocator = std.testing.allocator;
+    var dummy = struct {
+        allocator: std.mem.Allocator,
+        default_provider: []const u8,
+        configured_providers: []const config_types.ProviderEntry,
+    }{
+        .allocator = allocator,
+        .default_provider = "openrouter",
+        .configured_providers = &.{},
+    };
+
+    const primary = try configPrimaryModelForSelection(&dummy, "custom:https://example.com/gpt-4o");
+    defer allocator.free(primary);
+    try std.testing.expectEqualStrings("custom:https://example.com/gpt-4o", primary);
+}
+
+test "configPrimaryModelMutationValue serializes versionless custom defaults as object" {
+    const allocator = std.testing.allocator;
+    var dummy = struct {
+        allocator: std.mem.Allocator,
+        default_provider: []const u8,
+        configured_providers: []const config_types.ProviderEntry,
+    }{
+        .allocator = allocator,
+        .default_provider = "custom:https://example.com/api",
+        .configured_providers = &.{},
+    };
+
+    const value_raw = try configPrimaryModelMutationValue(&dummy, "meta-llama/Llama-4-70B-Instruct");
+    defer allocator.free(value_raw);
+
+    try std.testing.expectEqualStrings(
+        "{\"provider\":\"custom:https://example.com/api\",\"primary\":\"meta-llama/Llama-4-70B-Instruct\"}",
+        value_raw,
+    );
+}
+
+test "configPrimaryModelForSelection keeps configured versionless custom url namespace ref" {
+    const allocator = std.testing.allocator;
+    const configured = [_]config_types.ProviderEntry{
+        .{ .name = "custom:https://gateway.example.com" },
+    };
+    var dummy = struct {
+        allocator: std.mem.Allocator,
+        default_provider: []const u8,
+        configured_providers: []const config_types.ProviderEntry,
+    }{
+        .allocator = allocator,
+        .default_provider = "openrouter",
+        .configured_providers = &configured,
+    };
+
+    const primary = try configPrimaryModelForSelection(&dummy, "custom:https://gateway.example.com/qianfan/custom-model");
+    defer allocator.free(primary);
+    try std.testing.expectEqualStrings("custom:https://gateway.example.com/qianfan/custom-model", primary);
+}
+
 test "bareSessionResetPrompt returns prompt for bare /new" {
     const prompt = bareSessionResetPrompt("/new") orelse return error.TestExpectedEqual;
     try std.testing.expect(std.mem.indexOf(u8, prompt, "Execute your Session Startup sequence now") != null);
@@ -497,6 +1060,50 @@ test "hotApplyConfigChange updates model primary as provider plus model" {
     try std.testing.expectEqualStrings("openrouter", dummy.default_provider);
 }
 
+test "hotApplyConfigChange handles split custom provider reload payload" {
+    const allocator = std.testing.allocator;
+    var dummy = struct {
+        allocator: std.mem.Allocator,
+        model_name: []const u8,
+        model_name_owned: bool,
+        default_provider: []const u8,
+        default_provider_owned: bool,
+        default_model: []const u8,
+    }{
+        .allocator = allocator,
+        .model_name = "old-model",
+        .model_name_owned = false,
+        .default_provider = "old-provider",
+        .default_provider_owned = false,
+        .default_model = "old-model",
+    };
+    defer if (dummy.model_name_owned) allocator.free(dummy.model_name);
+    defer if (dummy.default_provider_owned) allocator.free(dummy.default_provider);
+
+    const cfg = config_module.Config{
+        .workspace_dir = "/tmp/nullclaw-test",
+        .config_path = "/tmp/nullclaw-test/config.json",
+        .default_provider = "custom:https://example.com/api",
+        .default_model = "meta-llama/Llama-4-70B-Instruct",
+        .allocator = allocator,
+    };
+
+    const value_json = try hotReloadValueJson(allocator, &cfg, "agents.defaults.model.primary");
+    defer allocator.free(value_json);
+
+    // Regression: hot reload must preserve split custom providers instead of truncating at the first slash.
+    const applied = try hotApplyConfigChange(
+        &dummy,
+        .set,
+        "agents.defaults.model.primary",
+        value_json,
+    );
+    try std.testing.expect(applied);
+    try std.testing.expectEqualStrings("meta-llama/Llama-4-70B-Instruct", dummy.model_name);
+    try std.testing.expectEqualStrings("meta-llama/Llama-4-70B-Instruct", dummy.default_model);
+    try std.testing.expectEqualStrings("custom:https://example.com/api", dummy.default_provider);
+}
+
 test "hotApplyConfigChange rejects malformed model primary" {
     const allocator = std.testing.allocator;
     var dummy = struct {
@@ -568,6 +1175,188 @@ test "hotApplyConfigChange model primary refreshes token and max token limits" {
     try std.testing.expectEqualStrings("openrouter", dummy.default_provider);
     try std.testing.expectEqual(@as(u64, 128_000), dummy.token_limit);
     try std.testing.expectEqual(@as(u32, 8192), dummy.max_tokens);
+}
+
+test "hotApplyConfigChange updates custom url model primary" {
+    const allocator = std.testing.allocator;
+    var dummy = struct {
+        allocator: std.mem.Allocator,
+        model_name: []const u8,
+        model_name_owned: bool,
+        default_provider: []const u8,
+        default_provider_owned: bool,
+        default_model: []const u8,
+        token_limit: u64,
+        token_limit_override: ?u64,
+        max_tokens: u32,
+        max_tokens_override: ?u32,
+    }{
+        .allocator = allocator,
+        .model_name = "old-model",
+        .model_name_owned = false,
+        .default_provider = "old-provider",
+        .default_provider_owned = false,
+        .default_model = "old-model",
+        .token_limit = 1024,
+        .token_limit_override = null,
+        .max_tokens = 128,
+        .max_tokens_override = null,
+    };
+    defer if (dummy.model_name_owned) allocator.free(dummy.model_name);
+    defer if (dummy.default_provider_owned) allocator.free(dummy.default_provider);
+
+    const applied = try hotApplyConfigChange(
+        &dummy,
+        .set,
+        "agents.defaults.model.primary",
+        "\"custom:https://api.example.com/openai/v2/qianfan/custom-model\"",
+    );
+    try std.testing.expect(applied);
+    try std.testing.expectEqualStrings("qianfan/custom-model", dummy.model_name);
+    try std.testing.expectEqualStrings("qianfan/custom-model", dummy.default_model);
+    try std.testing.expectEqualStrings("custom:https://api.example.com/openai/v2", dummy.default_provider);
+    try std.testing.expectEqual(@as(u64, 98_304), dummy.token_limit);
+    try std.testing.expectEqual(@as(u32, 32_768), dummy.max_tokens);
+}
+
+test "hotApplyConfigChange updates configured versionless custom url model primary" {
+    const allocator = std.testing.allocator;
+    const configured = [_]config_types.ProviderEntry{
+        .{ .name = "custom:https://gateway.example.com" },
+    };
+    var dummy = struct {
+        allocator: std.mem.Allocator,
+        model_name: []const u8,
+        model_name_owned: bool,
+        default_provider: []const u8,
+        default_provider_owned: bool,
+        default_model: []const u8,
+        token_limit: u64,
+        token_limit_override: ?u64,
+        max_tokens: u32,
+        max_tokens_override: ?u32,
+        configured_providers: []const config_types.ProviderEntry,
+    }{
+        .allocator = allocator,
+        .model_name = "old-model",
+        .model_name_owned = false,
+        .default_provider = "old-provider",
+        .default_provider_owned = false,
+        .default_model = "old-model",
+        .token_limit = 1024,
+        .token_limit_override = null,
+        .max_tokens = 128,
+        .max_tokens_override = null,
+        .configured_providers = &configured,
+    };
+    defer if (dummy.model_name_owned) allocator.free(dummy.model_name);
+    defer if (dummy.default_provider_owned) allocator.free(dummy.default_provider);
+
+    const applied = try hotApplyConfigChange(
+        &dummy,
+        .set,
+        "agents.defaults.model.primary",
+        "\"custom:https://gateway.example.com/qianfan/custom-model\"",
+    );
+    try std.testing.expect(applied);
+    try std.testing.expectEqualStrings("qianfan/custom-model", dummy.model_name);
+    try std.testing.expectEqualStrings("qianfan/custom-model", dummy.default_model);
+    try std.testing.expectEqualStrings("custom:https://gateway.example.com", dummy.default_provider);
+    try std.testing.expectEqual(@as(u64, 98_304), dummy.token_limit);
+    try std.testing.expectEqual(@as(u32, 32_768), dummy.max_tokens);
+}
+
+test "hotApplyConfigChange updates route-only custom url model primary" {
+    // Regression: hot reload must preserve explicit providers that exist only in model_routes.
+    const allocator = std.testing.allocator;
+    const routes = [_]config_types.ModelRouteConfig{
+        .{
+            .hint = "fast",
+            .provider = "custom:https://route.example.com/qianfan",
+            .model = "custom-model",
+        },
+    };
+    var dummy = struct {
+        allocator: std.mem.Allocator,
+        model_name: []const u8,
+        model_name_owned: bool,
+        default_provider: []const u8,
+        default_provider_owned: bool,
+        default_model: []const u8,
+        token_limit: u64,
+        token_limit_override: ?u64,
+        max_tokens: u32,
+        max_tokens_override: ?u32,
+        model_routes: []const config_types.ModelRouteConfig,
+    }{
+        .allocator = allocator,
+        .model_name = "old-model",
+        .model_name_owned = false,
+        .default_provider = "old-provider",
+        .default_provider_owned = false,
+        .default_model = "old-model",
+        .token_limit = 1024,
+        .token_limit_override = null,
+        .max_tokens = 128,
+        .max_tokens_override = null,
+        .model_routes = &routes,
+    };
+    defer if (dummy.model_name_owned) allocator.free(dummy.model_name);
+    defer if (dummy.default_provider_owned) allocator.free(dummy.default_provider);
+
+    const applied = try hotApplyConfigChange(
+        &dummy,
+        .set,
+        "agents.defaults.model.primary",
+        "\"custom:https://route.example.com/qianfan/custom-model\"",
+    );
+    try std.testing.expect(applied);
+    try std.testing.expectEqualStrings("custom-model", dummy.model_name);
+    try std.testing.expectEqualStrings("custom-model", dummy.default_model);
+    try std.testing.expectEqualStrings("custom:https://route.example.com/qianfan", dummy.default_provider);
+}
+
+test "hotApplyConfigChange updates fallback-only custom url model primary" {
+    // Regression: hot reload must preserve explicit providers that exist only in reliability fallbacks.
+    const allocator = std.testing.allocator;
+    var dummy = struct {
+        allocator: std.mem.Allocator,
+        model_name: []const u8,
+        model_name_owned: bool,
+        default_provider: []const u8,
+        default_provider_owned: bool,
+        default_model: []const u8,
+        token_limit: u64,
+        token_limit_override: ?u64,
+        max_tokens: u32,
+        max_tokens_override: ?u32,
+        fallback_providers: []const []const u8,
+    }{
+        .allocator = allocator,
+        .model_name = "old-model",
+        .model_name_owned = false,
+        .default_provider = "old-provider",
+        .default_provider_owned = false,
+        .default_model = "old-model",
+        .token_limit = 1024,
+        .token_limit_override = null,
+        .max_tokens = 128,
+        .max_tokens_override = null,
+        .fallback_providers = &.{"custom:https://fb.example.com/qianfan"},
+    };
+    defer if (dummy.model_name_owned) allocator.free(dummy.model_name);
+    defer if (dummy.default_provider_owned) allocator.free(dummy.default_provider);
+
+    const applied = try hotApplyConfigChange(
+        &dummy,
+        .set,
+        "agents.defaults.model.primary",
+        "\"custom:https://fb.example.com/qianfan/custom-model\"",
+    );
+    try std.testing.expect(applied);
+    try std.testing.expectEqualStrings("custom-model", dummy.model_name);
+    try std.testing.expectEqualStrings("custom-model", dummy.default_model);
+    try std.testing.expectEqualStrings("custom:https://fb.example.com/qianfan", dummy.default_provider);
 }
 
 test "hotApplyConfigChange updates agent status_show_emojis" {
@@ -876,15 +1665,40 @@ test "applyHotReloadConfig clears removed profile overrides and skips provider r
 }
 
 test "splitPrimaryModelRef parses provider model format" {
-    const parsed = splitPrimaryModelRef("openrouter/inception/mercury") orelse return error.TestUnexpectedResult;
+    const parsed = config_module.splitPrimaryModelRef("openrouter/inception/mercury") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("openrouter", parsed.provider);
     try std.testing.expectEqualStrings("inception/mercury", parsed.model);
 }
 
+test "splitPrimaryModelRef parses versioned custom provider model format" {
+    const parsed = config_module.splitPrimaryModelRef(
+        "custom:https://example.com/v2/meta-llama/Llama-4-70B-Instruct",
+    ) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("custom:https://example.com/v2", parsed.provider);
+    try std.testing.expectEqualStrings("meta-llama/Llama-4-70B-Instruct", parsed.model);
+}
+
+test "splitPrimaryModelRef parses versionless custom provider model format" {
+    const parsed = config_module.splitPrimaryModelRef(
+        "custom:https://example.com/api/qianfan/custom-model",
+    ) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("custom:https://example.com/api", parsed.provider);
+    try std.testing.expectEqualStrings("qianfan/custom-model", parsed.model);
+}
+
+test "splitPrimaryModelRef preserves custom url endpoint suffixes" {
+    const parsed = config_module.splitPrimaryModelRef(
+        "custom:https://my-api.example.com/api/v2/responses/my-model",
+    ) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("custom:https://my-api.example.com/api/v2/responses", parsed.provider);
+    try std.testing.expectEqualStrings("my-model", parsed.model);
+}
+
 test "splitPrimaryModelRef rejects malformed values" {
-    try std.testing.expect(splitPrimaryModelRef("noslash") == null);
-    try std.testing.expect(splitPrimaryModelRef("/model-only") == null);
-    try std.testing.expect(splitPrimaryModelRef("provider/") == null);
+    try std.testing.expect(config_module.splitPrimaryModelRef("noslash") == null);
+    try std.testing.expect(config_module.splitPrimaryModelRef("/model-only") == null);
+    try std.testing.expect(config_module.splitPrimaryModelRef("provider/") == null);
+    try std.testing.expect(config_module.splitPrimaryModelRef("custom:https://api.example.com/v1/") == null);
 }
 
 fn setExecNodeId(self: anytype, value: ?[]const u8) !void {
@@ -1031,6 +1845,34 @@ const DirectSkillCommandMatch = struct {
     user_input: []const u8,
 };
 
+const SkillLaunchMode = enum {
+    one_shot,
+    session_active,
+};
+
+const SkillMenuCommandChoice = struct {
+    label: []const u8,
+    submit_text: []const u8,
+};
+
+const SkillAffixKind = enum {
+    prefix,
+    suffix,
+};
+
+const SkillAffixEntry = struct {
+    token: []const u8,
+    count: usize,
+};
+
+const SkillLetterGroup = struct {
+    label: []const u8,
+    command: []const u8,
+};
+
+const SKILL_MENU_PAGE_SIZE: usize = 10;
+const SKILL_MENU_COLUMNS: u8 = 3;
+
 fn registerDirectSkillCommandMatch(
     match: *?DirectSkillCommandMatch,
     skill: *const skills_mod.Skill,
@@ -1047,7 +1889,976 @@ fn registerDirectSkillCommandMatch(
     return true;
 }
 
-fn executeSkillInvocation(self: anytype, skill: *const skills_mod.Skill, user_input: []const u8) ![]const u8 {
+fn clearActiveSkillSession(self: anytype) void {
+    if (!@hasField(@TypeOf(self.*), "active_skill_name")) return;
+
+    if (self.active_skill_name_owned and self.active_skill_name != null) self.allocator.free(self.active_skill_name.?);
+    if (self.active_skill_description_owned and self.active_skill_description != null) self.allocator.free(self.active_skill_description.?);
+    if (self.active_skill_instructions_owned and self.active_skill_instructions != null) self.allocator.free(self.active_skill_instructions.?);
+    if (self.active_skill_path_owned and self.active_skill_path != null) self.allocator.free(self.active_skill_path.?);
+
+    self.active_skill_name = null;
+    self.active_skill_name_owned = false;
+    self.active_skill_description = null;
+    self.active_skill_description_owned = false;
+    self.active_skill_instructions = null;
+    self.active_skill_instructions_owned = false;
+    self.active_skill_path = null;
+    self.active_skill_path_owned = false;
+    self.active_skill_interactive = false;
+}
+
+fn setActiveSkillSession(self: anytype, skill: *const skills_mod.Skill, interactive: bool) !void {
+    const owned_name = try self.allocator.dupe(u8, skill.name);
+    errdefer self.allocator.free(owned_name);
+
+    const owned_description = if (skill.description.len > 0)
+        try self.allocator.dupe(u8, skill.description)
+    else
+        null;
+    errdefer if (owned_description) |value| self.allocator.free(value);
+
+    const owned_instructions = if (skill.instructions.len > 0)
+        try self.allocator.dupe(u8, skill.instructions)
+    else
+        null;
+    errdefer if (owned_instructions) |value| self.allocator.free(value);
+
+    const owned_path = if (skill.path.len > 0)
+        try self.allocator.dupe(u8, skill.path)
+    else
+        null;
+    errdefer if (owned_path) |value| self.allocator.free(value);
+
+    clearActiveSkillSession(self);
+    self.active_skill_name = owned_name;
+    self.active_skill_name_owned = true;
+    self.active_skill_description = owned_description;
+    self.active_skill_description_owned = owned_description != null;
+    self.active_skill_instructions = owned_instructions;
+    self.active_skill_instructions_owned = owned_instructions != null;
+    self.active_skill_path = owned_path;
+    self.active_skill_path_owned = owned_path != null;
+    self.active_skill_interactive = interactive;
+}
+
+fn activeSkillModeLabel(interactive: bool) []const u8 {
+    return if (interactive) "interactive" else "non-interactive";
+}
+
+fn appendSkillLaunchContextBody(
+    self: anytype,
+    writer: anytype,
+    skill_name: []const u8,
+    skill_description: ?[]const u8,
+    skill_path: ?[]const u8,
+    interactive: bool,
+    launch_mode: SkillLaunchMode,
+) !void {
+    try writer.writeAll("- Launcher: nullclaw\n");
+    try writer.print("- Launch mode: {s}\n", .{switch (launch_mode) {
+        .one_shot => "one-off request",
+        .session_active => "session-bound",
+    }});
+    try writer.print("- Skill: {s}\n", .{skill_name});
+    if (skill_description) |value| {
+        if (value.len > 0) try writer.print("- Skill description: {s}\n", .{value});
+    }
+    if (skill_path) |value| {
+        if (value.len > 0) try writer.print("- Skill directory: {s}\n", .{value});
+    }
+    if (@hasField(@TypeOf(self.*), "workspace_dir")) {
+        try writer.print("- Agent workspace: {s}\n", .{self.workspace_dir});
+    }
+    try writer.print("- Interaction mode: {s}\n", .{activeSkillModeLabel(interactive)});
+
+    if (@hasField(@TypeOf(self.*), "conversation_context")) {
+        if (self.conversation_context) |ctx| {
+            if (ctx.channel) |value| try writer.print("- Channel: {s}\n", .{value});
+            if (ctx.account_id) |value| try writer.print("- Account ID: {s}\n", .{value});
+            if (ctx.peer_id) |value| try writer.print("- Peer ID: {s}\n", .{value});
+            if (ctx.group_id) |value| try writer.print("- Group ID: {s}\n", .{value});
+            if (ctx.is_group) |is_group| {
+                try writer.print("- Chat type: {s}\n", .{if (is_group) "group" else "direct"});
+            }
+        }
+    }
+
+    try writer.writeAll("\nOperational rules:\n");
+    try writer.writeAll("- This skill is running inside the current nullclaw agent session, not as a standalone CLI process.\n");
+    if (interactive) {
+        try writer.writeAll("- Interactive mode is ON. On Telegram and other supported channels, prefer `<nc_choices>...</nc_choices>` instead of `AskUserQuestion` or `mcp_question`.\n");
+    } else {
+        try writer.writeAll("- Interactive mode is OFF. Avoid clarification loops; choose sane defaults unless missing data truly blocks progress.\n");
+    }
+    if (launch_mode == .session_active) {
+        try writer.writeAll("- This skill remains active for later messages in the current session until `/skill clear` is used.\n");
+    }
+}
+
+fn buildSkillInvocationPrompt(
+    self: anytype,
+    skill: *const skills_mod.Skill,
+    user_input: []const u8,
+    interactive: bool,
+) ![]const u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(self.allocator);
+    var out_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &out);
+    const writer = &out_writer.writer;
+
+    try writer.print("Apply the skill `{s}`.\n\n", .{skill.name});
+    try writer.writeAll("## Skill Launch Context\n\n");
+    try appendSkillLaunchContextBody(
+        self,
+        writer,
+        skill.name,
+        if (skill.description.len > 0) skill.description else null,
+        if (skill.path.len > 0) skill.path else null,
+        interactive,
+        .one_shot,
+    );
+    if (skill.instructions.len > 0) {
+        try writer.writeAll("\n\n## Skill Instructions\n\n");
+        try writer.writeAll(skill.instructions);
+    }
+    try writer.writeAll("\n\n## Task\n\n");
+    try writer.writeAll(user_input);
+    out = out_writer.toArrayList();
+    return try out.toOwnedSlice(self.allocator);
+}
+
+pub fn buildActiveSkillPromptSection(self: anytype) !?[]const u8 {
+    if (!@hasField(@TypeOf(self.*), "active_skill_name")) return null;
+    const skill_name = self.active_skill_name orelse return null;
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(self.allocator);
+    var out_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &out);
+    const writer = &out_writer.writer;
+
+    try writer.writeAll("## Active Skill Session\n\n");
+    try writer.writeAll("An operator armed a session-scoped skill for this conversation. Treat subsequent user messages as work for that skill unless they explicitly clear or replace it.\n\n");
+    try appendSkillLaunchContextBody(
+        self,
+        writer,
+        skill_name,
+        self.active_skill_description,
+        self.active_skill_path,
+        self.active_skill_interactive,
+        .session_active,
+    );
+    if (self.active_skill_instructions) |instructions| {
+        if (instructions.len > 0) {
+            try writer.writeAll("\n\n## Active Skill Instructions\n\n");
+            try writer.writeAll(instructions);
+        }
+    }
+
+    out = out_writer.toArrayList();
+    return try out.toOwnedSlice(self.allocator);
+}
+
+fn shouldRenderSkillChoices(self: anytype) bool {
+    if (!@hasField(@TypeOf(self.*), "conversation_context")) return false;
+    const ctx = self.conversation_context orelse return false;
+    const channel = ctx.channel orelse return false;
+    return std.ascii.eqlIgnoreCase(channel, "telegram");
+}
+
+fn appendJsonString(writer: anytype, value: []const u8) !void {
+    try writer.print("{f}", .{std.json.fmt(value, .{})});
+}
+
+fn appendSkillCommandChoices(
+    self: anytype,
+    writer: anytype,
+    choices: []const SkillMenuCommandChoice,
+    columns: u8,
+) !void {
+    _ = self;
+    if (choices.len < interaction_choices.MIN_OPTIONS or choices.len > interaction_choices.MAX_OPTIONS) return;
+    const safe_columns: u8 = @max(@as(u8, 1), @min(columns, interaction_choices.MAX_COLUMNS));
+
+    try writer.writeAll("\n");
+    try writer.writeAll(interaction_choices.START_TAG);
+    try writer.print("{{\"v\":1,\"columns\":{d},\"options\":[", .{safe_columns});
+
+    var first = true;
+    for (choices, 0..) |choice, idx| {
+        if (!first) try writer.writeAll(",");
+        first = false;
+
+        var id_buf: [16]u8 = undefined;
+        const option_id = try std.fmt.bufPrint(&id_buf, "s{d}", .{idx + 1});
+        const label = if (choice.label.len > interaction_choices.MAX_LABEL_LEN)
+            choice.label[0..interaction_choices.MAX_LABEL_LEN]
+        else
+            choice.label;
+
+        try writer.writeAll("{\"id\":");
+        try appendJsonString(writer, option_id);
+        try writer.writeAll(",\"label\":");
+        try appendJsonString(writer, label);
+        try writer.writeAll(",\"submit_text\":");
+        try appendJsonString(writer, choice.submit_text);
+        try writer.writeAll("}");
+    }
+    try writer.writeAll("]}");
+    try writer.writeAll(interaction_choices.END_TAG);
+}
+
+fn appendSkillActionChoices(
+    self: anytype,
+    writer: anytype,
+    include_clear: bool,
+) !void {
+    if (!shouldRenderSkillChoices(self)) return;
+
+    const choices = if (include_clear)
+        [_]SkillMenuCommandChoice{
+            .{ .label = "Skills", .submit_text = "/skills" },
+            .{ .label = "Clear skill", .submit_text = "/skill clear" },
+        }
+    else
+        [_]SkillMenuCommandChoice{
+            .{ .label = "Skills", .submit_text = "/skills" },
+            .{ .label = "Skill status", .submit_text = "/skill status" },
+        };
+    try appendSkillCommandChoices(self, writer, &choices, 2);
+}
+
+fn countAvailableSkills(skills: []const skills_mod.Skill) usize {
+    var count: usize = 0;
+    for (skills) |skill| {
+        if (skill.available) count += 1;
+    }
+    return count;
+}
+
+fn unavailableSkillCount(skills: []const skills_mod.Skill) usize {
+    var count: usize = 0;
+    for (skills) |skill| {
+        if (!skill.available) count += 1;
+    }
+    return count;
+}
+
+fn parseSkillMenuPageIndex(arg: []const u8) usize {
+    const trimmed = std.mem.trim(u8, arg, " \t");
+    if (trimmed.len == 0) return 0;
+    const parsed = std.fmt.parseInt(usize, trimmed, 10) catch return 0;
+    if (parsed == 0) return 0;
+    return parsed - 1;
+}
+
+fn collectSortedSkillRefs(
+    allocator: std.mem.Allocator,
+    skills: []const skills_mod.Skill,
+    available_only: bool,
+) ![]*const skills_mod.Skill {
+    var refs: std.ArrayList(*const skills_mod.Skill) = .empty;
+    errdefer refs.deinit(allocator);
+
+    for (skills) |*skill| {
+        if (available_only and !skill.available) continue;
+        try refs.append(allocator, skill);
+    }
+
+    std.mem.sort(*const skills_mod.Skill, refs.items, {}, struct {
+        fn lessThan(_: void, left: *const skills_mod.Skill, right: *const skills_mod.Skill) bool {
+            return std.mem.lessThan(u8, left.name, right.name);
+        }
+    }.lessThan);
+
+    return try refs.toOwnedSlice(allocator);
+}
+
+fn skillPrefixToken(name: []const u8) ?[]const u8 {
+    const sep = std.mem.indexOfScalar(u8, name, '-') orelse return null;
+    if (sep == 0 or sep + 1 >= name.len) return null;
+    return name[0..sep];
+}
+
+fn skillSuffixToken(name: []const u8) ?[]const u8 {
+    const sep = std.mem.lastIndexOfScalar(u8, name, '-') orelse return null;
+    if (sep == 0 or sep + 1 >= name.len) return null;
+    return name[sep + 1 ..];
+}
+
+fn skillBaseName(name: []const u8) []const u8 {
+    const sep = std.mem.indexOfScalar(u8, name, '-') orelse return name;
+    if (sep + 1 >= name.len) return name;
+    return name[sep + 1 ..];
+}
+
+fn firstSkillBrowseLetter(name: []const u8) ?u8 {
+    for (name) |ch| {
+        if (std.ascii.isAlphabetic(ch)) return std.ascii.toLower(ch);
+    }
+    return null;
+}
+
+fn skillMatchesLetter(skill: *const skills_mod.Skill, letter: u8) bool {
+    if (firstSkillBrowseLetter(skill.name)) |value| {
+        if (value == letter) return true;
+    }
+
+    const prefix = skillPrefixToken(skill.name) orelse return false;
+    _ = prefix;
+    if (firstSkillBrowseLetter(skillBaseName(skill.name))) |value| {
+        return value == letter;
+    }
+    return false;
+}
+
+fn parseSkillLetterGroup(group: []const u8) ?SkillLetterGroup {
+    if (std.ascii.eqlIgnoreCase(group, "a-f")) return .{ .label = "A-F", .command = "/skills letters a-f" };
+    if (std.ascii.eqlIgnoreCase(group, "g-l")) return .{ .label = "G-L", .command = "/skills letters g-l" };
+    if (std.ascii.eqlIgnoreCase(group, "m-r")) return .{ .label = "M-R", .command = "/skills letters m-r" };
+    if (std.ascii.eqlIgnoreCase(group, "s-z")) return .{ .label = "S-Z", .command = "/skills letters s-z" };
+    return null;
+}
+
+fn skillLetterInGroup(letter: u8, group: []const u8) bool {
+    const normalized = std.ascii.toLower(letter);
+    if (normalized < 'a' or normalized > 'z') return false;
+    if (std.ascii.eqlIgnoreCase(group, "a-f")) return normalized >= 'a' and normalized <= 'f';
+    if (std.ascii.eqlIgnoreCase(group, "g-l")) return normalized >= 'g' and normalized <= 'l';
+    if (std.ascii.eqlIgnoreCase(group, "m-r")) return normalized >= 'm' and normalized <= 'r';
+    if (std.ascii.eqlIgnoreCase(group, "s-z")) return normalized >= 's' and normalized <= 'z';
+    return false;
+}
+
+fn skillLetterGroupCommand(letter: u8) []const u8 {
+    const normalized = std.ascii.toLower(letter);
+    return if (normalized >= 'a' and normalized <= 'f')
+        "/skills letters a-f"
+    else if (normalized >= 'g' and normalized <= 'l')
+        "/skills letters g-l"
+    else if (normalized >= 'm' and normalized <= 'r')
+        "/skills letters m-r"
+    else
+        "/skills letters s-z";
+}
+
+fn collectSkillAffixEntries(
+    allocator: std.mem.Allocator,
+    refs: []const *const skills_mod.Skill,
+    kind: SkillAffixKind,
+) ![]SkillAffixEntry {
+    var counts = std.StringHashMap(usize).init(allocator);
+    defer counts.deinit();
+
+    for (refs) |skill| {
+        const token = switch (kind) {
+            .prefix => skillPrefixToken(skill.name),
+            .suffix => skillSuffixToken(skill.name),
+        } orelse continue;
+
+        const gop = try counts.getOrPut(token);
+        if (gop.found_existing) {
+            gop.value_ptr.* += 1;
+        } else {
+            gop.value_ptr.* = 1;
+        }
+    }
+
+    const entries = try allocator.alloc(SkillAffixEntry, counts.count());
+    errdefer allocator.free(entries);
+
+    var idx: usize = 0;
+    var it = counts.iterator();
+    while (it.next()) |entry| : (idx += 1) {
+        entries[idx] = .{
+            .token = entry.key_ptr.*,
+            .count = entry.value_ptr.*,
+        };
+    }
+
+    std.mem.sort(SkillAffixEntry, entries, {}, struct {
+        fn lessThan(_: void, left: SkillAffixEntry, right: SkillAffixEntry) bool {
+            return std.mem.lessThan(u8, left.token, right.token);
+        }
+    }.lessThan);
+
+    return entries;
+}
+
+fn collectSkillRefsByLetter(
+    allocator: std.mem.Allocator,
+    refs: []const *const skills_mod.Skill,
+    letter: u8,
+) ![]*const skills_mod.Skill {
+    var filtered: std.ArrayList(*const skills_mod.Skill) = .empty;
+    errdefer filtered.deinit(allocator);
+
+    const normalized = std.ascii.toLower(letter);
+    for (refs) |skill| {
+        if (skillMatchesLetter(skill, normalized)) try filtered.append(allocator, skill);
+    }
+    return try filtered.toOwnedSlice(allocator);
+}
+
+fn collectSkillRefsByAffix(
+    allocator: std.mem.Allocator,
+    refs: []const *const skills_mod.Skill,
+    kind: SkillAffixKind,
+    token: []const u8,
+) ![]*const skills_mod.Skill {
+    var filtered: std.ArrayList(*const skills_mod.Skill) = .empty;
+    errdefer filtered.deinit(allocator);
+
+    for (refs) |skill| {
+        const candidate = switch (kind) {
+            .prefix => skillPrefixToken(skill.name),
+            .suffix => skillSuffixToken(skill.name),
+        } orelse continue;
+        if (!std.ascii.eqlIgnoreCase(candidate, token)) continue;
+        try filtered.append(allocator, skill);
+    }
+    return try filtered.toOwnedSlice(allocator);
+}
+
+fn formatSkillBrowserRoot(self: anytype, skills: []const skills_mod.Skill) ![]const u8 {
+    if (!shouldRenderSkillChoices(self)) {
+        return try formatSkillListText(self, skills);
+    }
+    if (skills.len == 0) {
+        return try formatSkillInactiveReply(self, "No skills found in workspace.");
+    }
+
+    const available_total = countAvailableSkills(skills);
+    if (available_total == 0) {
+        return try std.fmt.allocPrint(
+            self.allocator,
+            "No available skills found in workspace. Unavailable skills: {d}.",
+            .{unavailableSkillCount(skills)},
+        );
+    }
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(self.allocator);
+    var out_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &out);
+    const writer = &out_writer.writer;
+
+    try writer.print("Skill browser: {d} available skill(s).\n", .{available_total});
+    if (@hasField(@TypeOf(self.*), "active_skill_name")) {
+        if (self.active_skill_name) |name| {
+            try writer.print("Current active skill: {s} ({s}).\n", .{
+                name,
+                activeSkillModeLabel(self.active_skill_interactive),
+            });
+        }
+    }
+    const hidden_unavailable = unavailableSkillCount(skills);
+    if (hidden_unavailable > 0) {
+        try writer.print("Unavailable skills hidden: {d}.\n", .{hidden_unavailable});
+    }
+    try writer.writeAll("Choose a letter range, prefix, suffix, or open the full sorted list. Letter filters match both the raw skill name and the base name after the first prefix.");
+
+    var choices = [_]SkillMenuCommandChoice{
+        .{ .label = "A-F", .submit_text = "/skills letters a-f" },
+        .{ .label = "G-L", .submit_text = "/skills letters g-l" },
+        .{ .label = "M-R", .submit_text = "/skills letters m-r" },
+        .{ .label = "S-Z", .submit_text = "/skills letters s-z" },
+        .{ .label = "Prefixes", .submit_text = "/skills prefixes" },
+        .{ .label = "Suffixes", .submit_text = "/skills suffixes" },
+        .{ .label = "All skills", .submit_text = "/skills all" },
+        .{ .label = "Skill status", .submit_text = "/skill status" },
+    };
+    try appendSkillCommandChoices(self, writer, &choices, SKILL_MENU_COLUMNS);
+    out = out_writer.toArrayList();
+    return try out.toOwnedSlice(self.allocator);
+}
+
+fn formatSkillListText(self: anytype, skills: []const skills_mod.Skill) ![]const u8 {
+    if (skills.len == 0) {
+        return try formatSkillInactiveReply(self, "No skills found in workspace.");
+    }
+
+    const refs = try collectSortedSkillRefs(self.allocator, skills, false);
+    defer self.allocator.free(refs);
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(self.allocator);
+    var out_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &out);
+    const writer = &out_writer.writer;
+
+    try writer.writeAll("Available skills:\n");
+    for (refs) |skill| {
+        try writer.print("  - {s}", .{skill.name});
+        if (skill.description.len > 0) try writer.print(": {s}", .{skill.description});
+        if (!skill.available) try writer.print(" (unavailable: {s})", .{skill.missing_deps});
+        if (@hasField(@TypeOf(self.*), "active_skill_name") and self.active_skill_name != null and
+            std.mem.eql(u8, self.active_skill_name.?, skill.name))
+        {
+            try writer.print(" [active: {s}]", .{activeSkillModeLabel(self.active_skill_interactive)});
+        }
+        try writer.writeAll("\n");
+    }
+
+    if (@hasField(@TypeOf(self.*), "active_skill_name")) {
+        if (self.active_skill_name) |name| {
+            try writer.print("\nCurrent active skill: {s} ({s})\n", .{
+                name,
+                activeSkillModeLabel(self.active_skill_interactive),
+            });
+        }
+    }
+
+    try writer.writeAll("\nUse `/skill <name>` to arm a non-interactive session skill, `/iskill <name>` for an interactive session skill, or `/skill <name> <task>` for a one-off skill task.");
+    out = out_writer.toArrayList();
+    return try out.toOwnedSlice(self.allocator);
+}
+
+fn formatSkillRefListPage(
+    self: anytype,
+    title: []const u8,
+    refs: []const *const skills_mod.Skill,
+    page_index: usize,
+    next_prefix: []const u8,
+    back_submit: []const u8,
+) ![]const u8 {
+    if (refs.len == 0) {
+        return try formatSkillInactiveReply(self, "No matching skills found.");
+    }
+
+    if (!shouldRenderSkillChoices(self)) {
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer out.deinit(self.allocator);
+        var out_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &out);
+        const writer = &out_writer.writer;
+        try writer.print("{s}:\n", .{title});
+        for (refs) |skill| {
+            try writer.print("  - {s}", .{skill.name});
+            if (skill.description.len > 0) try writer.print(": {s}", .{skill.description});
+            try writer.writeAll("\n");
+        }
+        out = out_writer.toArrayList();
+        return try out.toOwnedSlice(self.allocator);
+    }
+
+    const safe_page_index = @min(page_index, (refs.len - 1) / SKILL_MENU_PAGE_SIZE);
+    const start = safe_page_index * SKILL_MENU_PAGE_SIZE;
+    const end = @min(start + SKILL_MENU_PAGE_SIZE, refs.len);
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(self.allocator);
+    var out_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &out);
+    const writer = &out_writer.writer;
+
+    try writer.print("{s}: showing {d}-{d} of {d}.\n", .{
+        title,
+        start + 1,
+        end,
+        refs.len,
+    });
+    try writer.writeAll("Tap a skill to activate it in interactive mode. Use /skill <name> for non-interactive mode.");
+
+    var choices_buf: [interaction_choices.MAX_OPTIONS]SkillMenuCommandChoice = undefined;
+    var choices_len: usize = 0;
+
+    for (refs[start..end]) |skill| {
+        const submit_text = try std.fmt.allocPrint(self.allocator, "/iskill {s}", .{skill.name});
+        errdefer self.allocator.free(submit_text);
+        choices_buf[choices_len] = .{
+            .label = skill.name,
+            .submit_text = submit_text,
+        };
+        choices_len += 1;
+    }
+
+    if (end < refs.len and choices_len < interaction_choices.MAX_OPTIONS) {
+        const next_submit = try std.fmt.allocPrint(self.allocator, "{s} {d}", .{ next_prefix, safe_page_index + 2 });
+        errdefer self.allocator.free(next_submit);
+        choices_buf[choices_len] = .{
+            .label = "More",
+            .submit_text = next_submit,
+        };
+        choices_len += 1;
+    }
+
+    if (choices_len < interaction_choices.MAX_OPTIONS) {
+        choices_buf[choices_len] = .{
+            .label = "Back",
+            .submit_text = back_submit,
+        };
+        choices_len += 1;
+    }
+
+    defer {
+        for (choices_buf[0 .. end - start]) |choice| {
+            self.allocator.free(choice.submit_text);
+        }
+        if (end < refs.len) {
+            self.allocator.free(choices_buf[end - start].submit_text);
+        }
+    }
+
+    try appendSkillCommandChoices(self, writer, choices_buf[0..choices_len], SKILL_MENU_COLUMNS);
+    out = out_writer.toArrayList();
+    return try out.toOwnedSlice(self.allocator);
+}
+
+fn formatSkillLetterGroupMenu(
+    self: anytype,
+    refs: []const *const skills_mod.Skill,
+    group: []const u8,
+) ![]const u8 {
+    const parsed_group = parseSkillLetterGroup(group) orelse return try formatSkillInactiveReply(self, "Unknown letter range.");
+
+    if (!shouldRenderSkillChoices(self)) {
+        return try self.allocator.dupe(u8, "Letter menus are optimized for Telegram. Use /skills there to browse interactively.");
+    }
+
+    var present: [26]bool = [_]bool{false} ** 26;
+    for (refs) |skill| {
+        if (firstSkillBrowseLetter(skill.name)) |letter| {
+            if (skillLetterInGroup(letter, group)) present[letter - 'a'] = true;
+        }
+        if (firstSkillBrowseLetter(skillBaseName(skill.name))) |letter| {
+            if (skillLetterInGroup(letter, group)) present[letter - 'a'] = true;
+        }
+    }
+
+    var choices_buf: [interaction_choices.MAX_OPTIONS]SkillMenuCommandChoice = undefined;
+    var choices_len: usize = 0;
+    for (present, 0..) |is_present, idx| {
+        if (!is_present) continue;
+        const letter = @as(u8, @intCast(idx)) + 'a';
+        const submit_text = try std.fmt.allocPrint(self.allocator, "/skills letter {c}", .{letter});
+        errdefer self.allocator.free(submit_text);
+        const label = try std.fmt.allocPrint(self.allocator, "{c}", .{std.ascii.toUpper(letter)});
+        errdefer self.allocator.free(label);
+        choices_buf[choices_len] = .{
+            .label = label,
+            .submit_text = submit_text,
+        };
+        choices_len += 1;
+    }
+
+    if (choices_len == 0) {
+        return try formatSkillInactiveReply(self, "No matching letters found for this range.");
+    }
+
+    choices_buf[choices_len] = .{
+        .label = "Back",
+        .submit_text = "/skills",
+    };
+    choices_len += 1;
+
+    defer {
+        for (choices_buf[0..choices_len]) |choice| {
+            if (choice.label.len == 1 and std.ascii.isAlphabetic(choice.label[0])) self.allocator.free(choice.label);
+            if (std.mem.startsWith(u8, choice.submit_text, "/skills ")) self.allocator.free(choice.submit_text);
+        }
+    }
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(self.allocator);
+    var out_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &out);
+    const writer = &out_writer.writer;
+    try writer.print("Letter range {s}. Choose a starting letter.\n", .{parsed_group.label});
+    try writer.writeAll("Matches include both the raw skill name and the base name after the first prefix.");
+    try appendSkillCommandChoices(self, writer, choices_buf[0..choices_len], SKILL_MENU_COLUMNS);
+    out = out_writer.toArrayList();
+    return try out.toOwnedSlice(self.allocator);
+}
+
+fn formatSkillAffixMenu(
+    self: anytype,
+    refs: []const *const skills_mod.Skill,
+    kind: SkillAffixKind,
+    page_index: usize,
+) ![]const u8 {
+    const entries = try collectSkillAffixEntries(self.allocator, refs, kind);
+    defer self.allocator.free(entries);
+
+    if (entries.len == 0) {
+        return try formatSkillInactiveReply(self, "No skill prefixes or suffixes found.");
+    }
+
+    if (!shouldRenderSkillChoices(self)) {
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer out.deinit(self.allocator);
+        var out_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &out);
+        const writer = &out_writer.writer;
+        try writer.print("{s}:\n", .{if (kind == .prefix) "Skill prefixes" else "Skill suffixes"});
+        for (entries) |entry| {
+            if (kind == .prefix) {
+                try writer.print("  - {s}- ({d})\n", .{ entry.token, entry.count });
+            } else {
+                try writer.print("  - -{s} ({d})\n", .{ entry.token, entry.count });
+            }
+        }
+        out = out_writer.toArrayList();
+        return try out.toOwnedSlice(self.allocator);
+    }
+
+    const safe_page_index = @min(page_index, (entries.len - 1) / SKILL_MENU_PAGE_SIZE);
+    const start = safe_page_index * SKILL_MENU_PAGE_SIZE;
+    const end = @min(start + SKILL_MENU_PAGE_SIZE, entries.len);
+    const next_prefix = if (kind == .prefix) "/skills prefixes" else "/skills suffixes";
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(self.allocator);
+    var out_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &out);
+    const writer = &out_writer.writer;
+    try writer.print("{s}: showing {d}-{d} of {d}.\n", .{
+        if (kind == .prefix) "Skill prefixes" else "Skill suffixes",
+        start + 1,
+        end,
+        entries.len,
+    });
+    try writer.writeAll("Choose an affix to narrow the skill list.");
+
+    var choices_buf: [interaction_choices.MAX_OPTIONS]SkillMenuCommandChoice = undefined;
+    var choices_len: usize = 0;
+
+    for (entries[start..end]) |entry| {
+        const submit_text = switch (kind) {
+            .prefix => try std.fmt.allocPrint(self.allocator, "/skills prefix {s}", .{entry.token}),
+            .suffix => try std.fmt.allocPrint(self.allocator, "/skills suffix {s}", .{entry.token}),
+        };
+        errdefer self.allocator.free(submit_text);
+        const label = switch (kind) {
+            .prefix => try std.fmt.allocPrint(self.allocator, "{s}- ({d})", .{ entry.token, entry.count }),
+            .suffix => try std.fmt.allocPrint(self.allocator, "-{s} ({d})", .{ entry.token, entry.count }),
+        };
+        errdefer self.allocator.free(label);
+        choices_buf[choices_len] = .{
+            .label = label,
+            .submit_text = submit_text,
+        };
+        choices_len += 1;
+    }
+
+    if (end < entries.len and choices_len < interaction_choices.MAX_OPTIONS) {
+        const next_submit = try std.fmt.allocPrint(self.allocator, "{s} {d}", .{ next_prefix, safe_page_index + 2 });
+        errdefer self.allocator.free(next_submit);
+        choices_buf[choices_len] = .{
+            .label = "More",
+            .submit_text = next_submit,
+        };
+        choices_len += 1;
+    }
+
+    choices_buf[choices_len] = .{
+        .label = "Back",
+        .submit_text = "/skills",
+    };
+    choices_len += 1;
+
+    defer {
+        for (choices_buf[0..choices_len]) |choice| {
+            if (std.mem.startsWith(u8, choice.label, "-") or std.mem.indexOfScalar(u8, choice.label, '(') != null) self.allocator.free(choice.label);
+            if (std.mem.startsWith(u8, choice.submit_text, "/skills ")) self.allocator.free(choice.submit_text);
+        }
+    }
+
+    try appendSkillCommandChoices(self, writer, choices_buf[0..choices_len], SKILL_MENU_COLUMNS);
+    out = out_writer.toArrayList();
+    return try out.toOwnedSlice(self.allocator);
+}
+
+fn formatSkillList(self: anytype, skills: []const skills_mod.Skill, arg: []const u8) ![]const u8 {
+    if (skills.len == 0) {
+        return try formatSkillInactiveReply(self, "No skills found in workspace.");
+    }
+
+    const available_total = countAvailableSkills(skills);
+    if (available_total == 0) {
+        return try std.fmt.allocPrint(
+            self.allocator,
+            "No available skills found in workspace. Unavailable skills: {d}.",
+            .{unavailableSkillCount(skills)},
+        );
+    }
+
+    const available_refs = try collectSortedSkillRefs(self.allocator, skills, true);
+    defer self.allocator.free(available_refs);
+
+    const trimmed = std.mem.trim(u8, arg, " \t");
+    if (trimmed.len == 0) {
+        return try formatSkillBrowserRoot(self, skills);
+    }
+
+    if (parsePositiveUsize(trimmed)) |page_num| {
+        return try formatSkillRefListPage(self, "All skills", available_refs, page_num - 1, "/skills all", "/skills");
+    }
+
+    const parsed = splitFirstToken(trimmed);
+    const head = parsed.head;
+    const tail = std.mem.trim(u8, parsed.tail, " \t");
+
+    if (std.ascii.eqlIgnoreCase(head, "all")) {
+        return try formatSkillRefListPage(self, "All skills", available_refs, parseSkillMenuPageIndex(tail), "/skills all", "/skills");
+    }
+
+    if (std.ascii.eqlIgnoreCase(head, "letters")) {
+        return try formatSkillLetterGroupMenu(self, available_refs, tail);
+    }
+
+    if (std.ascii.eqlIgnoreCase(head, "letter")) {
+        const letter_arg = splitFirstToken(tail);
+        if (letter_arg.head.len != 1 or !std.ascii.isAlphabetic(letter_arg.head[0])) {
+            return try formatSkillInactiveReply(self, "Usage: /skills letter <a-z>");
+        }
+        const letter = std.ascii.toLower(letter_arg.head[0]);
+        const filtered = try collectSkillRefsByLetter(self.allocator, available_refs, letter);
+        defer self.allocator.free(filtered);
+
+        const title = try std.fmt.allocPrint(self.allocator, "Skills for letter {c}", .{std.ascii.toUpper(letter)});
+        defer self.allocator.free(title);
+        const next_prefix = try std.fmt.allocPrint(self.allocator, "/skills letter {c}", .{letter});
+        defer self.allocator.free(next_prefix);
+
+        return try formatSkillRefListPage(
+            self,
+            title,
+            filtered,
+            parseSkillMenuPageIndex(letter_arg.tail),
+            next_prefix,
+            skillLetterGroupCommand(letter),
+        );
+    }
+
+    if (std.ascii.eqlIgnoreCase(head, "prefixes")) {
+        return try formatSkillAffixMenu(self, available_refs, .prefix, parseSkillMenuPageIndex(tail));
+    }
+
+    if (std.ascii.eqlIgnoreCase(head, "suffixes")) {
+        return try formatSkillAffixMenu(self, available_refs, .suffix, parseSkillMenuPageIndex(tail));
+    }
+
+    if (std.ascii.eqlIgnoreCase(head, "prefix") or std.ascii.eqlIgnoreCase(head, "suffix")) {
+        const token_arg = splitFirstToken(tail);
+        if (token_arg.head.len == 0) {
+            return try formatSkillInactiveReply(
+                self,
+                if (std.ascii.eqlIgnoreCase(head, "prefix")) "Usage: /skills prefix <name>" else "Usage: /skills suffix <name>",
+            );
+        }
+
+        const kind: SkillAffixKind = if (std.ascii.eqlIgnoreCase(head, "prefix")) .prefix else .suffix;
+        const filtered = try collectSkillRefsByAffix(self.allocator, available_refs, kind, token_arg.head);
+        defer self.allocator.free(filtered);
+
+        const title = switch (kind) {
+            .prefix => try std.fmt.allocPrint(self.allocator, "Skills with prefix {s}-", .{token_arg.head}),
+            .suffix => try std.fmt.allocPrint(self.allocator, "Skills with suffix -{s}", .{token_arg.head}),
+        };
+        defer self.allocator.free(title);
+
+        const next_prefix = switch (kind) {
+            .prefix => try std.fmt.allocPrint(self.allocator, "/skills prefix {s}", .{token_arg.head}),
+            .suffix => try std.fmt.allocPrint(self.allocator, "/skills suffix {s}", .{token_arg.head}),
+        };
+        defer self.allocator.free(next_prefix);
+        const back_submit = if (kind == .prefix)
+            try self.allocator.dupe(u8, "/skills prefixes")
+        else
+            try self.allocator.dupe(u8, "/skills suffixes");
+        defer self.allocator.free(back_submit);
+
+        return try formatSkillRefListPage(
+            self,
+            title,
+            filtered,
+            parseSkillMenuPageIndex(token_arg.tail),
+            next_prefix,
+            back_submit,
+        );
+    }
+
+    return try formatSkillBrowserRoot(self, skills);
+}
+
+fn formatSkillActivatedReply(
+    self: anytype,
+    skill: *const skills_mod.Skill,
+    interactive: bool,
+) ![]const u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(self.allocator);
+    var out_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &out);
+    const writer = &out_writer.writer;
+
+    try writer.print("Active skill set to `{s}` ({s}).\n", .{
+        skill.name,
+        activeSkillModeLabel(interactive),
+    });
+    if (skill.path.len > 0) {
+        try writer.print("Skill directory: {s}\n", .{skill.path});
+    }
+    try writer.writeAll("Send your next message to continue in this skill. Use /skill clear to leave it.");
+    try appendSkillActionChoices(self, writer, true);
+    out = out_writer.toArrayList();
+    return try out.toOwnedSlice(self.allocator);
+}
+
+fn formatSkillInactiveReply(self: anytype, text: []const u8) ![]const u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(self.allocator);
+    var out_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &out);
+    const writer = &out_writer.writer;
+
+    try writer.writeAll(text);
+    try appendSkillActionChoices(self, writer, false);
+    out = out_writer.toArrayList();
+    return try out.toOwnedSlice(self.allocator);
+}
+
+fn formatSkillUnknownReply(self: anytype, name: []const u8) ![]const u8 {
+    const text = try std.fmt.allocPrint(self.allocator, "Skill not found: {s}", .{name});
+    defer self.allocator.free(text);
+    return try formatSkillInactiveReply(self, text);
+}
+
+fn formatSkillAmbiguousReply(self: anytype, name: []const u8) ![]const u8 {
+    const text = try formatAmbiguousSkillName(self, name);
+    defer self.allocator.free(text);
+    return try formatSkillInactiveReply(self, text);
+}
+
+fn formatActiveSkillStatus(self: anytype) ![]const u8 {
+    if (!@hasField(@TypeOf(self.*), "active_skill_name") or self.active_skill_name == null) {
+        return try formatSkillInactiveReply(self, "No active skill session. Use /skills to browse or /skill <name> to activate one.");
+    }
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(self.allocator);
+    var out_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &out);
+    const writer = &out_writer.writer;
+
+    try writer.print("Active skill: {s}\n", .{self.active_skill_name.?});
+    try writer.print("Mode: {s}\n", .{activeSkillModeLabel(self.active_skill_interactive)});
+    if (self.active_skill_description) |value| {
+        if (value.len > 0) try writer.print("Description: {s}\n", .{value});
+    }
+    if (self.active_skill_path) |value| {
+        if (value.len > 0) try writer.print("Skill directory: {s}\n", .{value});
+    }
+    if (@hasField(@TypeOf(self.*), "conversation_context")) {
+        if (self.conversation_context) |ctx| {
+            if (ctx.channel) |value| try writer.print("Channel: {s}\n", .{value});
+            if (ctx.account_id) |value| try writer.print("Account: {s}\n", .{value});
+            if (ctx.peer_id) |value| try writer.print("Peer: {s}\n", .{value});
+        }
+    }
+    try writer.writeAll("Use /skill clear to leave this skill session.");
+    try appendSkillActionChoices(self, writer, true);
+    out = out_writer.toArrayList();
+    return try out.toOwnedSlice(self.allocator);
+}
+
+fn executeSkillInvocation(
+    self: anytype,
+    skill: *const skills_mod.Skill,
+    user_input: []const u8,
+    interactive: bool,
+) ![]const u8 {
     if (!skill.available) {
         return try std.fmt.allocPrint(
             self.allocator,
@@ -1071,18 +2882,7 @@ fn executeSkillInvocation(self: anytype, skill: *const skills_mod.Skill, user_in
         );
     }
 
-    const composed = if (skill.instructions.len > 0)
-        try std.fmt.allocPrint(
-            self.allocator,
-            "Apply the skill `{s}`.\n\nSkill instructions:\n{s}\n\nTask:\n{s}",
-            .{ skill.name, skill.instructions, user_input },
-        )
-    else
-        try std.fmt.allocPrint(
-            self.allocator,
-            "Apply the skill `{s}`.\n\nTask:\n{s}",
-            .{ skill.name, user_input },
-        );
+    const composed = try buildSkillInvocationPrompt(self, skill, user_input, interactive);
     defer self.allocator.free(composed);
 
     if (findSubagentManager(self) != null) {
@@ -1096,7 +2896,7 @@ fn executeSkillInvocation(self: anytype, skill: *const skills_mod.Skill, user_in
 }
 
 fn tryHandleDirectSkillCommand(self: anytype, cmd: SlashCommand) !?[]const u8 {
-    const skills = skills_mod.listSkills(self.allocator, self.workspace_dir) catch return null;
+    const skills = skills_mod.listSkills(self.allocator, self.workspace_dir, self.observer) catch return null;
     defer skills_mod.freeSkills(self.allocator, skills);
 
     var resolved: ?DirectSkillCommandMatch = null;
@@ -1137,7 +2937,7 @@ fn tryHandleDirectSkillCommand(self: anytype, cmd: SlashCommand) !?[]const u8 {
     }
 
     if (resolved) |match| {
-        return try executeSkillInvocation(self, match.skill, match.user_input);
+        return try executeSkillInvocation(self, match.skill, match.user_input, false);
     }
     return null;
 }
@@ -1356,6 +3156,7 @@ fn findShellTool(self: anytype) ?Tool {
 fn clearSessionState(self: anytype) void {
     self.clearHistory();
     clearPendingExecCommand(self);
+    clearActiveSkillSession(self);
     if (@hasField(@TypeOf(self.*), "total_tokens")) {
         self.total_tokens = 0;
     }
@@ -1537,7 +3338,8 @@ fn resetRuntimeCommandState(self: anytype) void {
 fn formatStatus(self: anytype) ![]const u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(self.allocator);
-    const w = out.writer(self.allocator);
+    var out_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &out);
+    const w = &out_writer.writer;
 
     const show_emojis = if (@hasField(@TypeOf(self.*), "status_show_emojis")) self.status_show_emojis else true;
     const title_prefix = if (show_emojis) "🌊 " else "";
@@ -1556,12 +3358,21 @@ fn formatStatus(self: anytype) ![]const u8 {
     const send_label = if (show_emojis) "📤 Send" else "Send";
     const ttl_label = if (show_emojis) "⏰ Session TTL" else "Session TTL";
     const tasks_label = if (show_emojis) "🧵 Tasks" else "Tasks";
+    const skill_label = if (show_emojis) "🪄 Skill" else "Skill";
 
     try w.print("{s}NullClaw {s}\n", .{ title_prefix, version.string });
     if (@hasField(@TypeOf(self.*), "profile_name")) {
         try w.print("Agent profile: {s}\n", .{self.profile_name orelse "default"});
     }
     try w.print("{s}: {s}\n", .{ model_label, self.model_name });
+    if (@hasField(@TypeOf(self.*), "active_skill_name") and self.active_skill_name != null) {
+        try w.print(
+            "{s}: {s} ({s})\n",
+            .{ skill_label, self.active_skill_name.?, activeSkillModeLabel(self.active_skill_interactive) },
+        );
+    } else {
+        try w.print("{s}: off\n", .{skill_label});
+    }
     try w.print("{s}: {d} messages\n", .{ history_label, self.history.items.len });
     try w.print("{s}: {d}\n", .{ tokens_label, self.total_tokens });
     try w.print("{s}: {d} available\n", .{ tools_label, self.tools.len });
@@ -1615,6 +3426,7 @@ fn formatStatus(self: anytype) ![]const u8 {
             );
         }
     }
+    out = out_writer.toArrayList();
     return try out.toOwnedSlice(self.allocator);
 }
 
@@ -1659,7 +3471,8 @@ fn handleExecCommand(self: anytype, arg: []const u8) ![]const u8 {
     if (arg.len == 0 or std.ascii.eqlIgnoreCase(arg, "status")) {
         var out: std.ArrayListUnmanaged(u8) = .empty;
         errdefer out.deinit(self.allocator);
-        const w = out.writer(self.allocator);
+        var out_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &out);
+        const w = &out_writer.writer;
         try w.print(
             "Exec: host={s} security={s} ask={s}",
             .{ self.exec_host.toSlice(), self.exec_security.toSlice(), self.exec_ask.toSlice() },
@@ -1667,6 +3480,7 @@ fn handleExecCommand(self: anytype, arg: []const u8) ![]const u8 {
         if (self.exec_node_id) |id| {
             try w.print(" node={s}", .{id});
         }
+        out = out_writer.toArrayList();
         return try out.toOwnedSlice(self.allocator);
     }
 
@@ -1697,7 +3511,8 @@ fn handleExecCommand(self: anytype, arg: []const u8) ![]const u8 {
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(self.allocator);
-    const w = out.writer(self.allocator);
+    var out_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &out);
+    const w = &out_writer.writer;
     try w.print(
         "Exec set: host={s} security={s} ask={s}",
         .{ self.exec_host.toSlice(), self.exec_security.toSlice(), self.exec_ask.toSlice() },
@@ -1705,6 +3520,7 @@ fn handleExecCommand(self: anytype, arg: []const u8) ![]const u8 {
     if (self.exec_node_id) |id| {
         try w.print(" node={s}", .{id});
     }
+    out = out_writer.toArrayList();
     return try out.toOwnedSlice(self.allocator);
 }
 
@@ -1877,11 +3693,13 @@ fn handleAllowlistCommand(self: anytype, arg: []const u8) ![]const u8 {
     if (self.policy) |pol| {
         var out: std.ArrayListUnmanaged(u8) = .empty;
         errdefer out.deinit(self.allocator);
-        const w = out.writer(self.allocator);
+        var out_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &out);
+        const w = &out_writer.writer;
         try w.writeAll("Allowlisted commands:\n");
         for (pol.allowed_commands) |cmd| {
             try w.print("  - {s}\n", .{cmd});
         }
+        out = out_writer.toArrayList();
         return try out.toOwnedSlice(self.allocator);
     }
     return try self.allocator.dupe(u8, "No runtime allowlist policy attached.");
@@ -1927,17 +3745,17 @@ fn handleContextCommand(self: anytype, arg: []const u8) ![]const u8 {
 fn handleExportSessionCommand(self: anytype, arg: []const u8) ![]const u8 {
     const raw_path = firstToken(arg);
     const path = if (raw_path.len == 0)
-        try std.fmt.allocPrint(self.allocator, "{s}/session-{d}.md", .{ self.workspace_dir, std.time.timestamp() })
-    else if (std.fs.path.isAbsolute(raw_path))
+        try std.fmt.allocPrint(self.allocator, "{s}/session-{d}.md", .{ self.workspace_dir, std_compat.time.timestamp() })
+    else if (std_compat.fs.path.isAbsolute(raw_path))
         try self.allocator.dupe(u8, raw_path)
     else
         try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ self.workspace_dir, raw_path });
     defer self.allocator.free(path);
 
-    const file = if (std.fs.path.isAbsolute(path))
-        try std.fs.createFileAbsolute(path, .{ .truncate = true, .read = false })
+    const file = if (std_compat.fs.path.isAbsolute(path))
+        try std_compat.fs.createFileAbsolute(path, .{ .truncate = true, .read = false })
     else
-        try std.fs.cwd().createFile(path, .{ .truncate = true, .read = false });
+        try std_compat.fs.cwd().createFile(path, .{ .truncate = true, .read = false });
     defer file.close();
     var out_buf: [4096]u8 = undefined;
     var bw = file.writer(&out_buf);
@@ -2109,8 +3927,8 @@ fn runShellCommand(self: anytype, command: []const u8, skip_approval_gate: bool)
     defer arena_impl.deinit();
     const arena = arena_impl.allocator();
 
-    var args = std.json.ObjectMap.init(arena);
-    try args.put("command", .{ .string = command });
+    var args: std.json.ObjectMap = .empty;
+    try args.put(arena, "command", .{ .string = command });
 
     const result = shell_tool.execute(arena, args) catch |err| {
         return try std.fmt.allocPrint(self.allocator, "Bash failed: {s}", .{@errorName(err)});
@@ -2210,7 +4028,8 @@ fn formatSubagentList(self: anytype, include_details: bool) ![]const u8 {
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(self.allocator);
-    const w = out.writer(self.allocator);
+    var out_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &out);
+    const w = &out_writer.writer;
 
     manager.mutex.lock();
     defer manager.mutex.unlock();
@@ -2241,10 +4060,12 @@ fn formatSubagentList(self: anytype, include_details: bool) ![]const u8 {
 
     if (visible_count == 0) {
         try w.writeAll("No subagents tracked in this session.");
+        out = out_writer.toArrayList();
         return try out.toOwnedSlice(self.allocator);
     }
 
     try w.print("Totals: running={d}, completed={d}, failed={d}", .{ running, completed, failed });
+    out = out_writer.toArrayList();
     return try out.toOwnedSlice(self.allocator);
 }
 
@@ -2494,7 +4315,8 @@ fn handleTellCommand(self: anytype, arg: []const u8) ![]const u8 {
 fn handlePollCommand(self: anytype) ![]const u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(self.allocator);
-    const w = out.writer(self.allocator);
+    var out_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &out);
+    const w = &out_writer.writer;
 
     var wrote_any = false;
     if (self.pending_exec_command) |cmd| {
@@ -2533,6 +4355,7 @@ fn handlePollCommand(self: anytype) ![]const u8 {
     if (!wrote_any) {
         return try self.allocator.dupe(u8, "No pending approvals or background tasks.");
     }
+    out = out_writer.toArrayList();
     return try out.toOwnedSlice(self.allocator);
 }
 
@@ -2631,12 +4454,30 @@ fn parseJsonBool(raw: []const u8) ?bool {
     };
 }
 
-fn splitPrimaryModelRef(primary: []const u8) ?struct { provider: []const u8, model: []const u8 } {
-    const slash = std.mem.indexOfScalar(u8, primary, '/') orelse return null;
-    if (slash == 0 or slash + 1 >= primary.len) return null;
-    return .{
-        .provider = primary[0..slash],
-        .model = primary[slash + 1 ..],
+fn parseHotReloadPrimaryModelRef(
+    self: anytype,
+    allocator: std.mem.Allocator,
+    raw: []const u8,
+) !?config_module.PrimaryModelRef {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch return null;
+    return switch (parsed.value) {
+        .string => |primary| if (splitPrimaryModelRefForSelf(self, primary)) |split|
+            config_module.PrimaryModelRef{
+                .provider = split.provider,
+                .model = split.model,
+            }
+        else
+            null,
+        .object => |obj| blk: {
+            const provider_val = obj.get("provider") orelse break :blk null;
+            const primary_val = obj.get("primary") orelse break :blk null;
+            if (provider_val != .string or primary_val != .string) break :blk null;
+            break :blk .{
+                .provider = provider_val.string,
+                .model = primary_val.string,
+            };
+        },
+        else => null,
     };
 }
 
@@ -2665,9 +4506,9 @@ fn hotApplyConfigChange(
     if (action == .unset) return false;
 
     if (std.mem.eql(u8, path, "agents.defaults.model.primary")) {
-        const primary = try parseJsonStringOwned(self.allocator, new_value_json) orelse return false;
-        defer self.allocator.free(primary);
-        const parsed = splitPrimaryModelRef(primary) orelse return false;
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const parsed = try parseHotReloadPrimaryModelRef(self, arena.allocator(), new_value_json) orelse return false;
         try setModelName(self, parsed.model);
         try setDefaultProvider(self, parsed.provider);
         if (@hasField(@TypeOf(self.*), "default_model")) {
@@ -2734,8 +4575,8 @@ fn loadHotReloadConfig(backing_allocator: std.mem.Allocator) !config_module.Conf
     const allocator = arena_ptr.allocator();
 
     const config_path = try config_mutator.defaultConfigPath(allocator);
-    const config_dir = std.fs.path.dirname(config_path) orelse return error.InvalidPath;
-    const default_workspace_dir = try std.fs.path.join(allocator, &.{ config_dir, "workspace" });
+    const config_dir = std_compat.fs.path.dirname(config_path) orelse return error.InvalidPath;
+    const default_workspace_dir = try config_paths.defaultWorkspaceDirFromConfigDir(allocator, config_dir);
 
     var cfg = config_module.Config{
         .workspace_dir = default_workspace_dir,
@@ -2744,7 +4585,7 @@ fn loadHotReloadConfig(backing_allocator: std.mem.Allocator) !config_module.Conf
         .arena = arena_ptr,
     };
 
-    if (std.fs.openFileAbsolute(config_path, .{})) |file| {
+    if (std_compat.fs.openFileAbsolute(config_path, .{})) |file| {
         defer file.close();
         const content = try file.readToEndAlloc(allocator, 1024 * 64);
         try cfg.parseJson(content);
@@ -2758,10 +4599,10 @@ fn loadHotReloadConfig(backing_allocator: std.mem.Allocator) !config_module.Conf
     }
 
     if (cfg.channels.nostr) |ns| {
-        ns.config_dir = std.fs.path.dirname(config_path) orelse ".";
+        ns.config_dir = std_compat.fs.path.dirname(config_path) orelse ".";
     }
     {
-        const dir = std.fs.path.dirname(config_path) orelse ".";
+        const dir = std_compat.fs.path.dirname(config_path) orelse ".";
         const teams_mut = @constCast(cfg.channels.teams);
         for (teams_mut) |*tc| {
             tc.config_dir = dir;
@@ -2780,6 +4621,15 @@ fn hotReloadValueJson(
 ) ![]u8 {
     if (std.mem.eql(u8, path, "agents.defaults.model.primary")) {
         const model = cfg.default_model orelse return allocator.dupe(u8, "null");
+        if (config_module.shouldSerializeDefaultModelProviderField(cfg.default_provider)) {
+            var arena = std.heap.ArenaAllocator.init(allocator);
+            defer arena.deinit();
+            var model_obj: std.json.ObjectMap = .empty;
+            try model_obj.put(arena.allocator(), "provider", .{ .string = cfg.default_provider });
+            try model_obj.put(arena.allocator(), "primary", .{ .string = model });
+            return try std.json.Stringify.valueAlloc(allocator, std.json.Value{ .object = model_obj }, .{});
+        }
+
         const primary = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ cfg.default_provider, model });
         defer allocator.free(primary);
         return try std.json.Stringify.valueAlloc(allocator, std.json.Value{ .string = primary }, .{});
@@ -3158,44 +5008,75 @@ fn handleConfigCommand(self: anytype, arg: []const u8) ![]const u8 {
     );
 }
 
-fn handleSkillCommand(self: anytype, arg: []const u8) ![]const u8 {
+fn handleSkillCommand(self: anytype, command_name: []const u8, arg: []const u8) ![]const u8 {
     const parsed = splitFirstToken(arg);
     const action_or_name = parsed.head;
+    const interactive_session = std.ascii.eqlIgnoreCase(command_name, "iskill");
+
+    if (std.ascii.eqlIgnoreCase(command_name, "skills")) {
+        const skills = skills_mod.listSkills(self.allocator, self.workspace_dir, self.observer) catch |err| {
+            return try std.fmt.allocPrint(self.allocator, "Failed to load skills: {s}", .{@errorName(err)});
+        };
+        defer skills_mod.freeSkills(self.allocator, skills);
+        return try formatSkillList(self, skills, arg);
+    }
 
     if (std.ascii.eqlIgnoreCase(action_or_name, "reload") or std.ascii.eqlIgnoreCase(action_or_name, "refresh")) {
         if (std.mem.trim(u8, parsed.tail, " \t").len > 0) {
             return try self.allocator.dupe(u8, "Usage: /skill reload");
         }
+        if (@hasField(@TypeOf(self.*), "active_skill_name")) {
+            if (self.active_skill_name) |active_name| {
+                const interactive = self.active_skill_interactive;
+                const skills = skills_mod.listSkills(self.allocator, self.workspace_dir, self.observer) catch |err| {
+                    return try std.fmt.allocPrint(self.allocator, "Failed to load skills: {s}", .{@errorName(err)});
+                };
+                defer skills_mod.freeSkills(self.allocator, skills);
+
+                switch (findSkillByNameNormalized(skills, active_name)) {
+                    .unique => |skill| try setActiveSkillSession(self, skill, interactive),
+                    else => clearActiveSkillSession(self),
+                }
+            }
+        }
         invalidateSystemPromptCache(self);
         return try self.allocator.dupe(u8, "Skills reloaded for this session. Updated skill instructions will apply on the next turn.");
     }
 
-    const skills = skills_mod.listSkills(self.allocator, self.workspace_dir) catch |err| {
+    const skills = skills_mod.listSkills(self.allocator, self.workspace_dir, self.observer) catch |err| {
         return try std.fmt.allocPrint(self.allocator, "Failed to load skills: {s}", .{@errorName(err)});
     };
     defer skills_mod.freeSkills(self.allocator, skills);
 
     if (action_or_name.len == 0 or std.ascii.eqlIgnoreCase(action_or_name, "list")) {
-        if (skills.len == 0) {
-            return try self.allocator.dupe(u8, "No skills found in workspace.");
+        return try formatSkillList(self, skills, parsed.tail);
+    }
+
+    if (std.ascii.eqlIgnoreCase(action_or_name, "status")) {
+        return try formatActiveSkillStatus(self);
+    }
+
+    if (std.ascii.eqlIgnoreCase(action_or_name, "clear") or std.ascii.eqlIgnoreCase(action_or_name, "off")) {
+        if (!@hasField(@TypeOf(self.*), "active_skill_name") or self.active_skill_name == null) {
+            return try formatSkillInactiveReply(self, "No active skill session.");
         }
-        var out: std.ArrayListUnmanaged(u8) = .empty;
-        errdefer out.deinit(self.allocator);
-        const w = out.writer(self.allocator);
-        try w.writeAll("Available skills:\n");
-        for (skills) |skill| {
-            try w.print("  - {s}", .{skill.name});
-            if (skill.description.len > 0) try w.print(": {s}", .{skill.description});
-            if (!skill.available) try w.print(" (unavailable: {s})", .{skill.missing_deps});
-            try w.writeAll("\n");
-        }
-        return try out.toOwnedSlice(self.allocator);
+        clearActiveSkillSession(self);
+        invalidateSystemPromptCache(self);
+        return try formatSkillInactiveReply(self, "Active skill session cleared.");
     }
 
     switch (findSkillByNameNormalized(skills, action_or_name)) {
-        .unique => |skill| return try executeSkillInvocation(self, skill, std.mem.trim(u8, parsed.tail, " \t")),
-        .ambiguous => return try formatAmbiguousSkillName(self, action_or_name),
-        .not_found => return try std.fmt.allocPrint(self.allocator, "Skill not found: {s}", .{action_or_name}),
+        .unique => |skill| {
+            const remaining = std.mem.trim(u8, parsed.tail, " \t");
+            if (remaining.len == 0) {
+                try setActiveSkillSession(self, skill, interactive_session);
+                invalidateSystemPromptCache(self);
+                return try formatSkillActivatedReply(self, skill, interactive_session);
+            }
+            return try executeSkillInvocation(self, skill, remaining, interactive_session);
+        },
+        .ambiguous => return try formatSkillAmbiguousReply(self, action_or_name),
+        .not_found => return try formatSkillUnknownReply(self, action_or_name),
     }
 }
 
@@ -3268,11 +5149,17 @@ pub fn composeFinalReply(
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(self.allocator);
-    const w = out.writer(self.allocator);
+    var out_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &out);
+    const w = &out_writer.writer;
 
     if (show_reasoning) {
         try w.writeAll("Reasoning:\n");
-        try w.writeAll(reasoning_content.?);
+        var lines = std.mem.splitScalar(u8, reasoning_content.?, '\n');
+        while (lines.next()) |line| {
+            try w.writeAll("> ");
+            try w.writeAll(line);
+            try w.writeAll("\n");
+        }
         try w.writeAll("\n\n");
     }
     try w.writeAll(base_text);
@@ -3290,6 +5177,7 @@ pub fn composeFinalReply(
         ),
     }
 
+    out = out_writer.toArrayList();
     return try out.toOwnedSlice(self.allocator);
 }
 
@@ -3334,10 +5222,43 @@ pub fn handleSlashCommand(self: anytype, message: []const u8) !?[]const u8 {
         .status => return try formatStatus(self),
         .whoami => return try formatWhoAmI(self),
         .model => {
+            const first = firstToken(cmd.arg);
+            if (std.ascii.eqlIgnoreCase(first, "page")) {
+                const page_raw = std.mem.trim(u8, splitFirstToken(cmd.arg).tail, " \t");
+                const page_number = parsePositiveUsize(page_raw) orelse 1;
+                if (try renderInteractiveProviderMenu(self, page_number)) |menu| {
+                    return menu;
+                }
+                return try self.formatModelStatus();
+            }
+            if (std.ascii.eqlIgnoreCase(first, "provider")) {
+                const provider_tail = splitFirstToken(cmd.arg).tail;
+                const provider_name = firstToken(provider_tail);
+                if (provider_name.len == 0) {
+                    if (try renderInteractiveProviderMenu(self, 1)) |menu| {
+                        return menu;
+                    }
+                    return try self.formatModelStatus();
+                }
+
+                const remainder = splitFirstToken(provider_tail).tail;
+                const page_number = if (std.ascii.eqlIgnoreCase(firstToken(remainder), "page"))
+                    parsePositiveUsize(std.mem.trim(u8, splitFirstToken(remainder).tail, " \t")) orelse 1
+                else
+                    1;
+
+                if (try renderInteractiveModelMenu(self, provider_name, page_number)) |menu| {
+                    return menu;
+                }
+                return try std.fmt.allocPrint(self.allocator, "No models available for provider: {s}", .{provider_name});
+            }
             if (cmd.arg.len == 0 or
                 std.ascii.eqlIgnoreCase(cmd.arg, "list") or
                 std.ascii.eqlIgnoreCase(cmd.arg, "status"))
             {
+                if (try renderInteractiveProviderMenu(self, 1)) |menu| {
+                    return menu;
+                }
                 return try self.formatModelStatus();
             }
             if (std.ascii.eqlIgnoreCase(cmd.arg, "auto")) {
@@ -3363,6 +5284,9 @@ pub fn handleSlashCommand(self: anytype, message: []const u8) !?[]const u8 {
                     "Automatic model routing enabled. Reverted to the configured default model: {s}",
                     .{self.model_name},
                 );
+            }
+            if (splitPrimaryModelRefForSelf(self, cmd.arg)) |parsed| {
+                try setDefaultProvider(self, parsed.provider);
             }
             try setModelName(self, cmd.arg);
             if (@hasField(@TypeOf(self.*), "model_pinned_by_user")) {
@@ -3428,7 +5352,7 @@ pub fn handleSlashCommand(self: anytype, message: []const u8) !?[]const u8 {
         .elevated => return try handleElevatedCommand(self, cmd.arg),
         .bash => return try handleBashCommand(self, cmd.arg),
         .poll => return try handlePollCommand(self),
-        .skill => return try handleSkillCommand(self, cmd.arg),
+        .skill => return try handleSkillCommand(self, cmd.name, cmd.arg),
         .doctor => return try handleDoctorCommand(self),
         .memory => return try handleMemoryCommand(self, cmd.arg),
         .unknown => {
@@ -3464,7 +5388,8 @@ fn handleMemoryCommand(self: anytype, arg: []const u8) ![]const u8 {
         const report = mem_rt.diagnose();
         var out: std.ArrayListUnmanaged(u8) = .empty;
         errdefer out.deinit(self.allocator);
-        const w = out.writer(self.allocator);
+        var out_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &out);
+        const w = &out_writer.writer;
         try w.print("Memory resolved config:\n", .{});
         try w.print("  backend: {s}\n", .{r.primary_backend});
         try w.print("  retrieval: {s}\n", .{r.retrieval_mode});
@@ -3485,6 +5410,7 @@ fn handleMemoryCommand(self: anytype, arg: []const u8) ![]const u8 {
         } else {
             try w.print("  outbox_pending: n/a\n", .{});
         }
+        out = out_writer.toArrayList();
         return try out.toOwnedSlice(self.allocator);
     }
 
@@ -3551,7 +5477,8 @@ fn handleMemoryCommand(self: anytype, arg: []const u8) ![]const u8 {
 
         var out: std.ArrayListUnmanaged(u8) = .empty;
         errdefer out.deinit(self.allocator);
-        const w = out.writer(self.allocator);
+        var out_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &out);
+        const w = &out_writer.writer;
         try w.print("Search results: {d}\n", .{results.len});
         for (results, 0..) |c, idx| {
             try w.print("  {d}. {s} [{s}] score={d:.4}", .{ idx + 1, c.key, c.category.toString(), c.final_score });
@@ -3561,10 +5488,10 @@ fn handleMemoryCommand(self: anytype, arg: []const u8) ![]const u8 {
                 try w.print(" vector_score=n/a", .{});
             }
             try w.print(" source={s}\n", .{c.source});
-            const preview_len = @min(@as(usize, 140), c.snippet.len);
-            const preview = c.snippet[0..preview_len];
-            try w.print("     {s}{s}\n", .{ preview, if (c.snippet.len > preview_len) "..." else "" });
+            const preview = util.previewUtf8(c.snippet, 140);
+            try w.print("     {s}{s}\n", .{ preview.slice, if (preview.truncated) "..." else "" });
         }
+        out = out_writer.toArrayList();
         return try out.toOwnedSlice(self.allocator);
     }
 
@@ -3609,18 +5536,19 @@ fn handleMemoryCommand(self: anytype, arg: []const u8) ![]const u8 {
         const shown = @min(limit, filtered_total);
         var out: std.ArrayListUnmanaged(u8) = .empty;
         errdefer out.deinit(self.allocator);
-        const w = out.writer(self.allocator);
+        var out_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &out);
+        const w = &out_writer.writer;
         try w.print("Memory entries: showing {d}/{d}\n", .{ shown, filtered_total });
         var written: usize = 0;
         for (entries) |e| {
             if (!include_internal and isInternalMemoryEntryKeyOrContent(e.key, e.content)) continue;
             if (written >= shown) break;
-            const preview_len = @min(@as(usize, 120), e.content.len);
-            const preview = e.content[0..preview_len];
+            const preview = util.previewUtf8(e.content, 120);
             try w.print("  {d}. {s} [{s}] {s}\n", .{ written + 1, e.key, e.category.toString(), e.timestamp });
-            try w.print("     {s}{s}\n", .{ preview, if (e.content.len > preview_len) "..." else "" });
+            try w.print("     {s}{s}\n", .{ preview.slice, if (preview.truncated) "..." else "" });
             written += 1;
         }
+        out = out_writer.toArrayList();
         return try out.toOwnedSlice(self.allocator);
     }
 

@@ -4,6 +4,7 @@
 //! generic system that handles all configured channels.
 
 const std = @import("std");
+const std_compat = @import("compat");
 const Allocator = std.mem.Allocator;
 const bus_mod = @import("bus.zig");
 const Config = @import("config.zig").Config;
@@ -15,6 +16,7 @@ const channel_loop = @import("channel_loop.zig");
 const health = @import("health.zig");
 const daemon = @import("daemon.zig");
 const channels_mod = @import("channels/root.zig");
+const telegram = channels_mod.telegram;
 const mattermost = channels_mod.mattermost;
 const discord = channels_mod.discord;
 const dingtalk = channels_mod.dingtalk;
@@ -94,6 +96,7 @@ pub const ChannelManager = struct {
         return switch (state) {
             .telegram => |ls| ls.last_activity.load(.acquire),
             .signal => |ls| ls.last_activity.load(.acquire),
+            .weixin => |ls| ls.last_activity.load(.acquire),
             .matrix => |ls| ls.last_activity.load(.acquire),
             .max => |ls| ls.last_activity.load(.acquire),
         };
@@ -103,6 +106,7 @@ pub const ChannelManager = struct {
         switch (state) {
             .telegram => |ls| ls.stop_requested.store(true, .release),
             .signal => |ls| ls.stop_requested.store(true, .release),
+            .weixin => |ls| ls.stop_requested.store(true, .release),
             .matrix => |ls| ls.stop_requested.store(true, .release),
             .max => |ls| ls.stop_requested.store(true, .release),
         }
@@ -112,6 +116,7 @@ pub const ChannelManager = struct {
         switch (state) {
             .telegram => |ls| self.allocator.destroy(ls),
             .signal => |ls| self.allocator.destroy(ls),
+            .weixin => |ls| self.allocator.destroy(ls),
             .matrix => |ls| self.allocator.destroy(ls),
             .max => |ls| self.allocator.destroy(ls),
         }
@@ -208,6 +213,11 @@ pub const ChannelManager = struct {
 
         const ch_ptr = try self.allocator.create(ChannelType);
         ch_ptr.* = ChannelType.initFromConfig(self.allocator, cfg);
+        if (comptime std.mem.eql(u8, field_name, "telegram")) {
+            ch_ptr.text_debounce_secs = telegram.TelegramChannel.textDebounceSecsFromMs(
+                self.config.messages.inbound.debounce_ms,
+            );
+        }
         self.maybeAttachBus(ch_ptr);
 
         const ch = ch_ptr.channel();
@@ -374,7 +384,7 @@ pub const ChannelManager = struct {
         const WATCH_INTERVAL_SECS: u64 = 10;
 
         while (!daemon.isShutdownRequested()) {
-            std.Thread.sleep(WATCH_INTERVAL_SECS * std.time.ns_per_s);
+            std_compat.thread.sleep(WATCH_INTERVAL_SECS * std.time.ns_per_s);
             if (daemon.isShutdownRequested()) break;
 
             for (self.entries.items) |*entry| {
@@ -393,7 +403,7 @@ pub const ChannelManager = struct {
                             log.info("Restarting {s} gateway (attempt {d})", .{ entry.name, entry.supervised.restart_count });
                             state.markError("channels", "gateway health check failed");
                             entry.channel.stop();
-                            std.Thread.sleep(entry.supervised.currentBackoffMs() * std.time.ns_per_ms);
+                            std_compat.thread.sleep(entry.supervised.currentBackoffMs() * std.time.ns_per_ms);
                             entry.channel.start() catch |err| {
                                 log.err("Failed to restart {s} gateway: {}", .{ entry.name, err });
                                 continue;
@@ -412,7 +422,7 @@ pub const ChannelManager = struct {
                 if (entry.listener_type != .polling) continue;
 
                 const polling_state = entry.polling_state orelse continue;
-                const now = std.time.timestamp();
+                const now = std_compat.time.timestamp();
                 const last = pollingLastActivity(polling_state);
                 const stale = (now - last) > STALE_THRESHOLD_SECS;
 
@@ -437,7 +447,7 @@ pub const ChannelManager = struct {
                         self.stopPollingThread(entry);
 
                         // Backoff
-                        std.Thread.sleep(entry.supervised.currentBackoffMs() * std.time.ns_per_ms);
+                        std_compat.thread.sleep(entry.supervised.currentBackoffMs() * std.time.ns_per_ms);
 
                         // Respawn
                         if (self.runtime) |rt| {
@@ -481,10 +491,12 @@ pub const ChannelManager = struct {
 // Tests
 // ════════════════════════════════════════════════════════════════════════════
 
-test "PollingState has telegram signal matrix and max variants" {
+test "PollingState has telegram signal weixin matrix and max variants" {
     try std.testing.expect(@intFromEnum(@as(std.meta.Tag(PollingState), .telegram)) !=
         @intFromEnum(@as(std.meta.Tag(PollingState), .signal)));
     try std.testing.expect(@intFromEnum(@as(std.meta.Tag(PollingState), .signal)) !=
+        @intFromEnum(@as(std.meta.Tag(PollingState), .weixin)));
+    try std.testing.expect(@intFromEnum(@as(std.meta.Tag(PollingState), .weixin)) !=
         @intFromEnum(@as(std.meta.Tag(PollingState), .matrix)));
     try std.testing.expect(@intFromEnum(@as(std.meta.Tag(PollingState), .matrix)) !=
         @intFromEnum(@as(std.meta.Tag(PollingState), .max)));
